@@ -2,7 +2,7 @@
 set -uo pipefail
 
 APP_NAME="iptables Vibe Panel"
-VERSION="0.2.1"
+VERSION="0.2.2"
 STATE_DIR="/etc/ipt-vibe-panel"
 RULES_FILE="$STATE_DIR/rules.conf"
 BACKUP_DIR="$STATE_DIR/backups"
@@ -58,7 +58,24 @@ enable_forward(){
 backup_rules(){ ensure_dirs; local file="$BACKUP_DIR/iptables-$(date +%Y%m%d-%H%M%S).rules"; command -v iptables-save >/dev/null 2>&1 && { iptables-save > "$file"; echo "$file"; } || echo ""; }
 save_persistent(){ if command -v netfilter-persistent >/dev/null 2>&1; then netfilter-persistent save >/dev/null 2>&1 || true; echo "netfilter-persistent"; else mkdir -p /etc/iptables; iptables-save > /etc/iptables/rules.v4; echo "/etc/iptables/rules.v4"; fi; }
 
+delete_chain_by_comment(){
+  local table="$1" chain="$2" num=""
+  while true; do
+    if [ -n "$table" ]; then
+      num=$(iptables -t "$table" -L "$chain" --line-numbers -n 2>/dev/null | awk -v tag="$TAG" '$0 ~ tag {print $1; exit}')
+    else
+      num=$(iptables -L "$chain" --line-numbers -n 2>/dev/null | awk -v tag="$TAG" '$0 ~ tag {print $1; exit}')
+    fi
+    [ -n "$num" ] || break
+    if [ -n "$table" ]; then iptables -t "$table" -D "$chain" "$num" >/dev/null 2>&1 || break; else iptables -D "$chain" "$num" >/dev/null 2>&1 || break; fi
+  done
+}
+
 delete_managed_iptables_rules(){
+  command -v iptables >/dev/null 2>&1 || return 0
+  delete_chain_by_comment nat PREROUTING
+  delete_chain_by_comment nat POSTROUTING
+  delete_chain_by_comment "" FORWARD
   command -v iptables-save >/dev/null 2>&1 || return 0
   iptables-save | grep -- "$TAG" | grep '^-A ' | while IFS= read -r rule; do
     local chain del_rule
@@ -84,6 +101,7 @@ add_rule_to_iptables(){
     $pre --dport "$lp" -m comment --comment "$mark" -j DNAT --to-destination "$target" || return 1
     iptables -t nat -A POSTROUTING -p "$proto" -d "$ip" --dport "$tp" -m comment --comment "$mark" -j MASQUERADE || return 1
     iptables -A FORWARD -p "$proto" -d "$ip" --dport "$tp" -m comment --comment "$mark" -j ACCEPT || return 1
+    iptables -A FORWARD -p "$proto" -s "$ip" --sport "$tp" -m conntrack --ctstate ESTABLISHED,RELATED -m comment --comment "$mark" -j ACCEPT || true
   done
   awk -F'|' -v id="$id" -v ip="$ip" 'BEGIN{OFS="|"} $1==id{$11=ip} {print}' "$RULES_FILE" > "$RULES_FILE.tmp" && mv "$RULES_FILE.tmp" "$RULES_FILE"
 }
