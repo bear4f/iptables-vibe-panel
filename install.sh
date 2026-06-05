@@ -7,12 +7,17 @@ RAW_BASE="${IPT_VIBE_RAW_BASE:-https://raw.githubusercontent.com/bear4f/iptables
 PORT="${IPT_VIBE_PORT:-}"
 
 if [ "$(id -u)" -ne 0 ]; then
-  echo "Please run as root. Example: sudo IPT_VIBE_PORT=8090 bash <(curl -fsSL $RAW_BASE/install.sh)"
+  echo "Please run as root. Example: curl -fsSL $RAW_BASE/install.sh | sudo env IPT_VIBE_PORT=8090 bash"
   exit 1
 fi
 
 if [ -z "$PORT" ]; then
-  read -rp "Panel listen port (required, 1-65535): " PORT
+  if [ -r /dev/tty ]; then
+    read -rp "Panel listen port (required, 1-65535): " PORT </dev/tty
+  else
+    echo "Panel listen port is required. Example: curl -fsSL $RAW_BASE/install.sh | sudo env IPT_VIBE_PORT=8090 bash"
+    exit 1
+  fi
 fi
 
 if ! echo "$PORT" | grep -Eq '^[0-9]+$' || [ "$PORT" -lt 1 ] || [ "$PORT" -gt 65535 ]; then
