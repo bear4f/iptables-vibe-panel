@@ -9,13 +9,21 @@
 推荐在 VPS 上直接执行：
 
 ```bash
-sudo IPT_VIBE_PORT=8090 bash <(curl -fsSL https://raw.githubusercontent.com/bear4f/iptables-vibe-panel/main/install.sh)
+curl -fsSL https://raw.githubusercontent.com/bear4f/iptables-vibe-panel/main/install.sh | sudo env IPT_VIBE_PORT=8090 bash
+```
+
+如果你的系统不适合管道执行，使用下载后执行的方式：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/bear4f/iptables-vibe-panel/main/install.sh -o /tmp/iptables-vibe-panel-install.sh
+sudo IPT_VIBE_PORT=8090 bash /tmp/iptables-vibe-panel-install.sh
 ```
 
 如果想交互式输入端口：
 
 ```bash
-sudo bash <(curl -fsSL https://raw.githubusercontent.com/bear4f/iptables-vibe-panel/main/install.sh)
+curl -fsSL https://raw.githubusercontent.com/bear4f/iptables-vibe-panel/main/install.sh -o /tmp/iptables-vibe-panel-install.sh
+sudo bash /tmp/iptables-vibe-panel-install.sh
 ```
 
 安装完成后打开：
