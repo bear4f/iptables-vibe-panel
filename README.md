@@ -1,81 +1,76 @@
 # iptables Vibe Panel
 
-一个轻量的 iptables 端口转发可视化操作面板，面向 Debian 10+、Ubuntu 和常见 systemd Linux 服务器。项目不依赖 npm 或第三方 Python 包，适合低版本 Debian 环境。
+一个在 VPS/SSH 终端里运行的 iptables 端口转发可视化菜单面板。它不是 HTTP 网站，不开放管理端口；安装后在 SSH 里输入 `zf` 或 `ipt-vibe` 即可打开类似脚本面板的交互菜单。
 
 ## 一键安装
-
-面板不内置默认端口，安装时必须指定或输入监听端口。
 
 推荐在 VPS 上直接执行：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/bear4f/iptables-vibe-panel/main/install.sh | sudo env IPT_VIBE_PORT=8090 bash
+curl -fsSL https://raw.githubusercontent.com/bear4f/iptables-vibe-panel/main/install.sh | sudo bash
 ```
 
-如果你的系统不适合管道执行，使用下载后执行的方式：
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/bear4f/iptables-vibe-panel/main/install.sh -o /tmp/iptables-vibe-panel-install.sh
-sudo IPT_VIBE_PORT=8090 bash /tmp/iptables-vibe-panel-install.sh
-```
-
-如果想交互式输入端口：
+如果你的系统不适合管道执行，使用下载后执行：
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/bear4f/iptables-vibe-panel/main/install.sh -o /tmp/iptables-vibe-panel-install.sh
 sudo bash /tmp/iptables-vibe-panel-install.sh
 ```
 
-安装完成后打开：
+安装完成后打开面板：
 
-```text
-http://服务器IP:你设置的端口
+```bash
+zf
 ```
 
-## 功能
+也可以使用完整命令：
 
-- 在网页面板里新增、编辑、删除端口转发规则。
+```bash
+ipt-vibe
+```
+
+## 面板功能
+
+- 安装/检查依赖。
+- 添加端口转发规则。
+- 查看转发规则。
+- 修改转发规则。
+- 删除转发规则。
+- 应用规则到 iptables。
+- 查看当前本工具管理的 iptables 规则。
+- 备份与恢复。
+- 卸载面板命令。
+
+## 规则能力
+
 - 支持 TCP、UDP、TCP+UDP。
+- 支持单端口和等长端口段转发。
 - 支持目标 IPv4 或域名，应用规则时自动解析域名。
 - 应用前备份当前 `iptables-save` 输出。
 - 只管理带 `ipt-vibe:` 标记的规则，不主动删除其他手工规则。
-- 自动检测系统、iptables 后端、nftables 可用性、IPv4 转发状态。
+- 自动检测系统、iptables 后端、IPv4 转发状态。
 
 ## 兼容策略
 
-默认执行后端是 `iptables`，这是 Debian 10 的稳妥选择。Debian 10 可能使用 `iptables-legacy`，新系统也可能让 `iptables` 指向 `nf_tables` 后端；面板会在状态页显示 `iptables --version` 和后端类型，但仍通过 iptables 命令管理规则。
+默认执行后端是 `iptables`，这是 Debian 10 的稳妥选择。Debian 10 可能使用 `iptables-legacy`，新系统也可能让 `iptables` 指向 `nf_tables` 后端；面板会显示 `iptables --version` 和后端类型，但仍通过 iptables 命令管理规则。
 
 当前版本专注 IPv4 DNAT。IPv6/nftables 原生规则可以后续按同一状态库扩展。
 
-## 其他安装方式
-
-克隆仓库后安装：
+## 克隆仓库安装
 
 ```bash
 git clone https://github.com/bear4f/iptables-vibe-panel.git
 cd iptables-vibe-panel
-sudo IPT_VIBE_PORT=8090 bash install.sh
-```
-
-手动运行也必须指定端口：
-
-```bash
-sudo python3 app.py --host 0.0.0.0 --port 8090
-```
-
-或：
-
-```bash
-sudo IPT_VIBE_PORT=8090 python3 app.py --host 0.0.0.0
+sudo bash install.sh
 ```
 
 ## 文件位置
 
-- 程序目录：`/opt/iptables-vibe-panel`
-- 状态库：`/etc/ipt-vibe-panel/rules.json`
+- 主命令：`/usr/local/bin/ipt-vibe`
+- 快捷命令：`/usr/local/bin/zf`
+- 状态库：`/etc/ipt-vibe-panel/rules.conf`
 - 备份目录：`/etc/ipt-vibe-panel/backups`
 - 日志：`/etc/ipt-vibe-panel/panel.log`
-- systemd 服务：`iptables-vibe-panel`
 
 ## 应用规则时做什么
 
@@ -88,24 +83,20 @@ sudo IPT_VIBE_PORT=8090 python3 app.py --host 0.0.0.0
 
 ## 常用命令
 
-查看服务状态：
+打开面板：
 
 ```bash
-systemctl status iptables-vibe-panel --no-pager
+zf
 ```
 
-重启服务：
+查看配置：
 
 ```bash
-systemctl restart iptables-vibe-panel
+cat /etc/ipt-vibe-panel/rules.conf
 ```
 
-查看日志：
+查看备份：
 
 ```bash
-journalctl -u iptables-vibe-panel -f
+ls -lh /etc/ipt-vibe-panel/backups
 ```
-
-## 建议
-
-生产环境请限制面板访问来源，例如只监听内网、配合反向代理认证，或用防火墙只允许管理员 IP 访问你设置的面板端口。
