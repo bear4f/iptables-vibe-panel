@@ -2,6 +2,28 @@
 
 一个轻量的 iptables 端口转发可视化操作面板，面向 Debian 10+、Ubuntu 和常见 systemd Linux 服务器。项目不依赖 npm 或第三方 Python 包，适合低版本 Debian 环境。
 
+## 一键安装
+
+面板不内置默认端口，安装时必须指定或输入监听端口。
+
+推荐在 VPS 上直接执行：
+
+```bash
+sudo IPT_VIBE_PORT=8090 bash <(curl -fsSL https://raw.githubusercontent.com/bear4f/iptables-vibe-panel/main/install.sh)
+```
+
+如果想交互式输入端口：
+
+```bash
+sudo bash <(curl -fsSL https://raw.githubusercontent.com/bear4f/iptables-vibe-panel/main/install.sh)
+```
+
+安装完成后打开：
+
+```text
+http://服务器IP:你设置的端口
+```
+
 ## 功能
 
 - 在网页面板里新增、编辑、删除端口转发规则。
@@ -17,30 +39,15 @@
 
 当前版本专注 IPv4 DNAT。IPv6/nftables 原生规则可以后续按同一状态库扩展。
 
-## 部署
+## 其他安装方式
 
-安装时必须显式设置面板监听端口，不内置默认端口。
-
-交互式安装：
+克隆仓库后安装：
 
 ```bash
+git clone https://github.com/bear4f/iptables-vibe-panel.git
 cd iptables-vibe-panel
-sudo bash install.sh
-```
-
-非交互式安装：
-
-```bash
 sudo IPT_VIBE_PORT=8090 bash install.sh
 ```
-
-安装完成后打开：
-
-```text
-http://服务器IP:你设置的端口
-```
-
-## 手动运行
 
 手动运行也必须指定端口：
 
@@ -70,6 +77,26 @@ sudo IPT_VIBE_PORT=8090 python3 app.py --host 0.0.0.0
 4. 删除所有带 `ipt-vibe:` 备注的旧规则。
 5. 根据面板状态库重建启用中的规则。
 6. 优先用 `netfilter-persistent save` 保存；没有该工具时写入 `/etc/iptables/rules.v4`。
+
+## 常用命令
+
+查看服务状态：
+
+```bash
+systemctl status iptables-vibe-panel --no-pager
+```
+
+重启服务：
+
+```bash
+systemctl restart iptables-vibe-panel
+```
+
+查看日志：
+
+```bash
+journalctl -u iptables-vibe-panel -f
+```
 
 ## 建议
 
