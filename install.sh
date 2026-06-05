@@ -3,10 +3,19 @@ set -euo pipefail
 
 APP_DIR="/opt/iptables-vibe-panel"
 SERVICE_FILE="/etc/systemd/system/iptables-vibe-panel.service"
-PORT="${IPT_VIBE_PORT:-8088}"
+PORT="${IPT_VIBE_PORT:-}"
 
 if [ "$(id -u)" -ne 0 ]; then
   echo "Please run as root: sudo bash install.sh"
+  exit 1
+fi
+
+if [ -z "$PORT" ]; then
+  read -rp "Panel listen port (required, 1-65535): " PORT
+fi
+
+if ! echo "$PORT" | grep -Eq '^[0-9]+$' || [ "$PORT" -lt 1 ] || [ "$PORT" -gt 65535 ]; then
+  echo "Invalid panel port: $PORT"
   exit 1
 fi
 
