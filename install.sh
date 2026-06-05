@@ -3,10 +3,11 @@ set -euo pipefail
 
 APP_DIR="/opt/iptables-vibe-panel"
 SERVICE_FILE="/etc/systemd/system/iptables-vibe-panel.service"
+RAW_BASE="${IPT_VIBE_RAW_BASE:-https://raw.githubusercontent.com/bear4f/iptables-vibe-panel/main}"
 PORT="${IPT_VIBE_PORT:-}"
 
 if [ "$(id -u)" -ne 0 ]; then
-  echo "Please run as root: sudo bash install.sh"
+  echo "Please run as root. Example: sudo IPT_VIBE_PORT=8090 bash <(curl -fsSL $RAW_BASE/install.sh)"
   exit 1
 fi
 
@@ -29,13 +30,24 @@ if ! command -v iptables >/dev/null 2>&1 || ! command -v iptables-save >/dev/nul
   DEBIAN_FRONTEND=noninteractive apt-get install -y iptables
 fi
 
+if ! command -v curl >/dev/null 2>&1; then
+  apt-get update
+  apt-get install -y curl
+fi
+
 if ! command -v netfilter-persistent >/dev/null 2>&1; then
   echo "netfilter-persistent is not installed; rules will be saved to /etc/iptables/rules.v4."
   echo "Recommended on Debian/Ubuntu: apt-get install -y iptables-persistent netfilter-persistent"
 fi
 
 mkdir -p "$APP_DIR" /etc/ipt-vibe-panel
-install -m 0755 app.py "$APP_DIR/app.py"
+
+if [ -f "app.py" ]; then
+  install -m 0755 app.py "$APP_DIR/app.py"
+else
+  curl -fsSL "$RAW_BASE/app.py" -o "$APP_DIR/app.py"
+  chmod 0755 "$APP_DIR/app.py"
+fi
 
 cat > "$SERVICE_FILE" <<EOF
 [Unit]
