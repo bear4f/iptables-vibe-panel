@@ -14,9 +14,9 @@ fi
 
 if command -v apt-get >/dev/null 2>&1; then
   apt-get update
-  DEBIAN_FRONTEND=noninteractive apt-get install -y iptables curl ca-certificates dnsutils
+  DEBIAN_FRONTEND=noninteractive apt-get install -y iptables iptables-persistent netfilter-persistent curl ca-certificates dnsutils
 else
-  echo "apt-get not found. Please make sure iptables, curl and DNS tools are installed."
+  echo "apt-get not found. Please make sure iptables, iptables-persistent, curl and DNS tools are installed."
 fi
 
 mkdir -p "$STATE_DIR"

@@ -2,7 +2,7 @@
 set -uo pipefail
 
 APP_NAME="iptables Vibe Panel"
-VERSION="0.2.3"
+VERSION="0.3.0"
 STATE_DIR="/etc/ipt-vibe-panel"
 RULES_FILE="$STATE_DIR/rules.conf"
 BACKUP_DIR="$STATE_DIR/backups"
@@ -13,7 +13,13 @@ RED='\033[31m'; GREEN='\033[32m'; YELLOW='\033[33m'; BLUE='\033[34m'; CYAN='\033
 
 need_root(){ [ "$(id -u)" -eq 0 ] || { echo -e "${RED}请使用 root 运行：sudo zf${RESET}"; exit 1; }; }
 ensure_dirs(){ mkdir -p "$STATE_DIR" "$BACKUP_DIR"; touch "$RULES_FILE"; }
-log(){ mkdir -p "$STATE_DIR" 2>/dev/null; echo "[$(date '+%F %T')] $*" >> "$LOG_FILE" 2>/dev/null; }
+log(){
+  mkdir -p "$STATE_DIR" 2>/dev/null
+  echo "[$(date '+%F %T')] $*" >> "$LOG_FILE" 2>/dev/null
+  if [ -f "$LOG_FILE" ] && [ "$(wc -c < "$LOG_FILE" 2>/dev/null || echo 0)" -gt 1048576 ]; then
+    tail -n 500 "$LOG_FILE" > "$LOG_FILE.tmp" 2>/dev/null && mv "$LOG_FILE.tmp" "$LOG_FILE" 2>/dev/null || true
+  fi
+}
 line(){ echo -e "${BLUE}========================================${RESET}"; }
 short_line(){ echo -e "${YELLOW}----------------------------------------${RESET}"; }
 
@@ -31,6 +37,13 @@ pause(){ local _p; echo; read_tty _p "按 Enter 返回菜单..." || true; }
 os_name(){ if [ -r /etc/os-release ]; then . /etc/os-release; echo "${PRETTY_NAME:-Linux}"; else uname -sr; fi; }
 iptables_backend(){ command -v iptables >/dev/null 2>&1 && iptables --version 2>/dev/null | sed 's/^iptables //' || echo "未安装"; }
 ip_forward_status(){ [ "$(cat /proc/sys/net/ipv4/ip_forward 2>/dev/null || echo 0)" = "1" ] && echo "已开启" || echo "未开启"; }
+conntrack_status(){
+  local c m
+  c=$(cat /proc/sys/net/netfilter/nf_conntrack_count 2>/dev/null)
+  m=$(cat /proc/sys/net/netfilter/nf_conntrack_max 2>/dev/null)
+  [ -n "$c" ] && [ -n "$m" ] && echo "$c / $m" || echo "未加载"
+}
+mem_status(){ free -m 2>/dev/null | awk '/^Mem:/{printf "%sMB / %sMB", $3, $2}' || echo "未知"; }
 managed_count(){ grep -cv '^\s*\(#\|$\)' "$RULES_FILE" 2>/dev/null || echo 0; }
 enabled_count(){ awk -F'|' '$3=="1"{c++} END{print c+0}' "$RULES_FILE" 2>/dev/null; }
 valid_port(){ echo "$1" | grep -Eq '^[0-9]+$' && [ "$1" -ge 1 ] && [ "$1" -le 65535 ]; }
@@ -66,7 +79,7 @@ install_deps(){
   clear; line; echo -e "${CYAN}安装/检查依赖${RESET}"; line
   if command -v apt-get >/dev/null 2>&1; then
     apt-get update
-    DEBIAN_FRONTEND=noninteractive apt-get install -y iptables curl ca-certificates dnsutils
+    DEBIAN_FRONTEND=noninteractive apt-get install -y iptables iptables-persistent netfilter-persistent curl ca-certificates dnsutils
   else
     echo -e "${YELLOW}未检测到 apt-get，请手动安装 iptables、curl。${RESET}"
   fi
@@ -85,8 +98,83 @@ enable_forward(){
   sysctl -p >/dev/null 2>&1 || true
 }
 
-backup_rules(){ ensure_dirs; local file="$BACKUP_DIR/iptables-$(date +%Y%m%d-%H%M%S).rules"; command -v iptables-save >/dev/null 2>&1 && { iptables-save > "$file"; echo "$file"; } || echo ""; }
-save_persistent(){ if command -v netfilter-persistent >/dev/null 2>&1; then netfilter-persistent save >/dev/null 2>&1 || true; echo "netfilter-persistent"; else mkdir -p /etc/iptables; iptables-save > /etc/iptables/rules.v4; echo "/etc/iptables/rules.v4"; fi; }
+# conntrack 调优：转发节点的内存主要消耗在内核连接跟踪表上。
+# 默认 tcp established 超时是 432000 秒（5 天），空闲连接会长期占用内存，
+# 高流量/UDP(VPN) 场景下连接跟踪表膨胀，容易触发 OOM 导致死机或重启。
+# 这里缩短过期时间，让陈旧连接尽快释放，从源头压低内存占用。
+tune_conntrack(){
+  modprobe nf_conntrack 2>/dev/null || true
+  [ -d /etc/modules-load.d ] && echo 'nf_conntrack' > /etc/modules-load.d/ipt-vibe.conf 2>/dev/null || true
+  local f=/etc/sysctl.d/99-ipt-vibe-conntrack.conf
+  cat > "$f" <<'EOF'
+# ipt-vibe-panel: 转发节点 conntrack 调优，降低内存占用、加快连接过期回收
+net.netfilter.nf_conntrack_tcp_timeout_established = 86400
+net.netfilter.nf_conntrack_tcp_timeout_time_wait = 30
+net.netfilter.nf_conntrack_tcp_timeout_close_wait = 30
+net.netfilter.nf_conntrack_tcp_timeout_fin_wait = 30
+net.netfilter.nf_conntrack_generic_timeout = 120
+net.netfilter.nf_conntrack_udp_timeout = 30
+net.netfilter.nf_conntrack_udp_timeout_stream = 120
+EOF
+  sysctl -p "$f" >/dev/null 2>&1 || true
+}
+
+backup_rules(){
+  ensure_dirs
+  command -v iptables-save >/dev/null 2>&1 || { echo ""; return; }
+  local file="$BACKUP_DIR/iptables-$(date +%Y%m%d-%H%M%S).rules"
+  iptables-save > "$file"
+  # 仅保留最近 10 份备份，避免备份目录无限增长占用磁盘
+  ls -1t "$BACKUP_DIR"/iptables-*.rules 2>/dev/null | tail -n +11 | while IFS= read -r old; do rm -f "$old"; done
+  echo "$file"
+}
+
+# 保证规则在重启/死机后能自动恢复。
+# 之前只把规则写进 /etc/iptables/rules.v4，但如果系统没装 netfilter-persistent，
+# 开机时没有任何东西去加载这个文件，重启后转发规则就全部丢失，必须手动重新应用。
+# 这里按可用能力自动落地一个开机恢复机制（systemd oneshot 或 cron @reboot）。
+ensure_boot_restore(){
+  local iptr; iptr=$(command -v iptables-restore 2>/dev/null) || iptr=/sbin/iptables-restore
+  if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
+    cat > /etc/systemd/system/ipt-vibe-restore.service <<EOF
+[Unit]
+Description=Restore ipt-vibe-panel iptables rules on boot
+DefaultDependencies=no
+After=systemd-modules-load.service local-fs.target
+Before=network-pre.target
+Wants=network-pre.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/sh -c 'test -f /etc/iptables/rules.v4 && $iptr < /etc/iptables/rules.v4'
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    systemctl enable ipt-vibe-restore.service >/dev/null 2>&1 || true
+    echo "ipt-vibe-restore.service (systemd)"
+  elif [ -d /etc/cron.d ]; then
+    printf '@reboot root %s < /etc/iptables/rules.v4\n' "$iptr" > /etc/cron.d/ipt-vibe-restore
+    chmod 0644 /etc/cron.d/ipt-vibe-restore 2>/dev/null || true
+    echo "cron @reboot"
+  else
+    echo "/etc/iptables/rules.v4（无法安装开机恢复，请手动安装 iptables-persistent）"
+  fi
+}
+
+save_persistent(){
+  mkdir -p /etc/iptables
+  iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
+  if command -v netfilter-persistent >/dev/null 2>&1; then
+    # 已安装 netfilter-persistent，其自带的 systemd 服务会在开机时恢复 rules.v4
+    netfilter-persistent save >/dev/null 2>&1 || true
+    echo "netfilter-persistent"
+  else
+    ensure_boot_restore
+  fi
+}
 
 delete_chain_by_comment(){
   local table="$1" chain="$2" num=""
@@ -136,7 +224,7 @@ add_rule_to_iptables(){
 apply_rules(){
   clear; line; echo -e "${CYAN}应用转发规则${RESET}"; line
   if ! command -v iptables >/dev/null 2>&1 || ! command -v iptables-save >/dev/null 2>&1; then echo -e "${RED}iptables 或 iptables-save 不可用，请先安装依赖。${RESET}"; pause; return; fi
-  ensure_dirs; enable_forward
+  ensure_dirs; enable_forward; tune_conntrack
   local bak saved ok=0 fail=0
   bak=$(backup_rules); [ -n "$bak" ] && echo -e "${YELLOW}已备份：$bak${RESET}"
   delete_managed_iptables_rules
@@ -212,9 +300,9 @@ backup_restore(){
   esac
   pause
 }
-uninstall_panel(){ clear; line; echo -e "${CYAN}卸载面板${RESET}"; line; local clean; read_tty clean "是否同时删除本工具管理的 iptables 规则？[y/N]: " || clean=""; if [ "$clean" = "y" ] || [ "$clean" = "Y" ]; then backup_rules >/dev/null; delete_managed_iptables_rules; save_persistent >/dev/null; fi; rm -f /usr/local/bin/ipt-vibe /usr/local/bin/zf; echo -e "${GREEN}命令已移除。配置目录保留：$STATE_DIR${RESET}"; pause; }
+uninstall_panel(){ clear; line; echo -e "${CYAN}卸载面板${RESET}"; line; local clean; read_tty clean "是否同时删除本工具管理的 iptables 规则？[y/N]: " || clean=""; if [ "$clean" = "y" ] || [ "$clean" = "Y" ]; then backup_rules >/dev/null; delete_managed_iptables_rules; save_persistent >/dev/null; fi; if command -v systemctl >/dev/null 2>&1 && [ -f /etc/systemd/system/ipt-vibe-restore.service ]; then systemctl disable --now ipt-vibe-restore.service >/dev/null 2>&1 || true; rm -f /etc/systemd/system/ipt-vibe-restore.service; systemctl daemon-reload >/dev/null 2>&1 || true; fi; rm -f /etc/cron.d/ipt-vibe-restore; rm -f /usr/local/bin/ipt-vibe /usr/local/bin/zf; echo -e "${GREEN}命令已移除。配置目录保留：$STATE_DIR${RESET}"; pause; }
 
-header(){ clear; line; echo -e "${CYAN}              $APP_NAME v$VERSION${RESET}"; line; echo -e "当前时间：${YELLOW}$(date '+%F %T')${RESET}"; echo -e "系统版本：${GREEN}$(os_name)${RESET}"; echo -e "内核版本：${GREEN}$(uname -r)${RESET}"; echo -e "iptables：${GREEN}$(iptables_backend)${RESET}"; echo -e "IPv4转发：${GREEN}$(ip_forward_status)${RESET}"; echo -e "规则数量：${GREEN}$(managed_count)${RESET} | 启用 ${GREEN}$(enabled_count)${RESET}"; echo -e "面板类型：${GREEN}SSH 终端菜单，不开放 HTTP 端口${RESET}"; line; }
+header(){ clear; line; echo -e "${CYAN}              $APP_NAME v$VERSION${RESET}"; line; echo -e "当前时间：${YELLOW}$(date '+%F %T')${RESET}"; echo -e "系统版本：${GREEN}$(os_name)${RESET}"; echo -e "内核版本：${GREEN}$(uname -r)${RESET}"; echo -e "iptables：${GREEN}$(iptables_backend)${RESET}"; echo -e "IPv4转发：${GREEN}$(ip_forward_status)${RESET}"; echo -e "连接跟踪：${GREEN}$(conntrack_status)${RESET} | 内存 ${GREEN}$(mem_status)${RESET}"; echo -e "规则数量：${GREEN}$(managed_count)${RESET} | 启用 ${GREEN}$(enabled_count)${RESET}"; echo -e "面板类型：${GREEN}SSH 终端菜单，不开放 HTTP 端口${RESET}"; line; }
 main_menu(){
   need_root; ensure_dirs
   while true; do

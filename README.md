@@ -36,9 +36,16 @@ sudo zf
 
 ## 当前版本
 
-当前脚本版本：`v0.2.3`
+当前脚本版本：`v0.3.0`
 
-`v0.2.3` 重点修复：
+`v0.3.0` 重点修复：
+
+- **重启/死机后规则丢失**：以前只把规则写进 `/etc/iptables/rules.v4`，若系统没装 `netfilter-persistent`，开机时没有任何服务去加载它，重启后转发全部失效，必须手动重新应用。现在会自动落地开机恢复机制：优先用 `netfilter-persistent`；没有时自动创建 systemd oneshot 服务 `ipt-vibe-restore.service`；再没有 systemd 时用 `cron @reboot` 兜底。安装脚本也会一并安装 `iptables-persistent`。
+- **内存占用高 / 偶发死机重启**：转发节点的内存主要消耗在内核 `nf_conntrack` 连接跟踪表上，默认 TCP established 超时长达 5 天，空闲连接长期驻留内存，UDP/VPN 高流量时连接跟踪表膨胀，容易触发 OOM 导致死机或重启。新版应用规则时会写入 conntrack 调优（缩短过期时间），从源头压低内存占用。
+- 面板顶部新增“连接跟踪 count/max”和“内存”实时状态，方便观察内存问题。
+- 备份目录只保留最近 10 份，日志超过 1MB 自动截断，避免磁盘无限增长。
+
+`v0.2.3` 修复：
 
 - 菜单输入强制从 SSH 终端读取，避免安装管道后一直提示“无效选项”。
 - 清理旧的异常 DNAT 规则，例如 `--to-destination :10773`。
@@ -48,7 +55,7 @@ sudo zf
 进入面板后，顶部应显示：
 
 ```text
-iptables Vibe Panel v0.2.3
+iptables Vibe Panel v0.3.0
 ```
 
 如果仍显示旧版本，请重新执行一键安装命令。
@@ -123,10 +130,11 @@ sudo zf
 
 1. 检查 root 权限、`iptables`、`iptables-save`。
 2. 开启 IPv4 转发：`net.ipv4.ip_forward=1`。
-3. 备份当前 `iptables-save` 输出。
-4. 删除所有带 `ipt-vibe:` 备注的旧规则。
-5. 根据面板状态库重建启用中的规则。
-6. 优先用 `netfilter-persistent save` 保存；没有该工具时写入 `/etc/iptables/rules.v4`。
+3. 写入 conntrack 调优（缩短连接跟踪表过期时间，降低内存占用）。
+4. 备份当前 `iptables-save` 输出（仅保留最近 10 份）。
+5. 删除所有带 `ipt-vibe:` 备注的旧规则。
+6. 根据面板状态库重建启用中的规则。
+7. 持久化并安装开机自动恢复：优先 `netfilter-persistent`；否则自动创建 systemd oneshot 服务 `ipt-vibe-restore.service`；再否则用 `cron @reboot` 兜底。这样重启或死机后规则会自动恢复，无需手动重新应用。
 
 ## 常见问题
 
@@ -170,6 +178,54 @@ sudo bash /tmp/iptables-vibe-panel-install.sh
 - 云厂商安全组已放行入口端口。
 - 目标服务器允许来自中转 VPS 公网 IP 的连接。
 
+### 重启 / 死机后转发失效，必须手动重新应用（v0.3.0 已修复）
+
+原因：旧版只把规则写进 `/etc/iptables/rules.v4`，但系统若没装 `netfilter-persistent`，开机时没有任何东西加载它，重启后规则全部丢失。
+
+请先更新到 `v0.3.0` 并重新“应用规则”，新版会自动安装开机恢复机制。确认是否生效：
+
+```bash
+# 方式一：systemd 恢复服务（新版无 netfilter-persistent 时自动创建）
+systemctl status ipt-vibe-restore.service
+systemctl is-enabled ipt-vibe-restore.service
+
+# 方式二：已安装 netfilter-persistent 时
+systemctl is-enabled netfilter-persistent
+
+# 持久化文件是否存在、且包含你的规则
+cat /etc/iptables/rules.v4 | grep ipt-vibe
+
+# 不重启也能演练一次开机恢复
+iptables -F && iptables -t nat -F   # 谨慎：会清空当前规则
+iptables-restore < /etc/iptables/rules.v4
+iptables-save | grep ipt-vibe
+```
+
+### 内存占用高 / 偶发死机重启（v0.3.0 已缓解）
+
+转发节点内存主要消耗在内核连接跟踪表 `nf_conntrack` 上。排查：
+
+```bash
+# 当前连接跟踪数 / 上限，接近上限会丢包并占用大量内存
+cat /proc/sys/net/netfilter/nf_conntrack_count
+cat /proc/sys/net/netfilter/nf_conntrack_max
+
+# 是否出现表满丢包 或 OOM（死机/重启的常见原因）
+dmesg | grep -i 'nf_conntrack: table full'
+dmesg | grep -i 'out of memory\|oom-kill'
+
+# 内存总览
+free -m
+```
+
+新版应用规则时会写入 `/etc/sysctl.d/99-ipt-vibe-conntrack.conf`，把默认 5 天的 TCP established 超时降到 1 天，并缩短其他状态超时，让陈旧连接尽快释放。如仍接近上限，可按 VPS 内存适当调整（约每条 300 字节）：
+
+```bash
+# 例如把上限设为 131072（约 40MB），按需修改
+sysctl -w net.netfilter.nf_conntrack_max=131072
+echo 'net.netfilter.nf_conntrack_max = 131072' > /etc/sysctl.d/99-ipt-vibe-ctmax.conf
+```
+
 ## 常用命令
 
 打开面板：
@@ -193,3 +249,5 @@ ls -lh /etc/ipt-vibe-panel/backups
 ## 安全说明
 
 本项目只提供 SSH 终端菜单，不提供 HTTP 后台，不监听 `8088` 或其他管理端口。安装脚本会清理旧版可能遗留的 `iptables-vibe-panel.service` systemd 服务文件。
+
+v0.3.0 为了让规则在重启后自动恢复，可能会创建一个 systemd oneshot 服务 `ipt-vibe-restore.service`。它是 `Type=oneshot`：仅在开机时执行一次 `iptables-restore` 后立即退出，不常驻、不监听端口、不占用运行内存。若系统已装 `netfilter-persistent` 则复用它、不创建该服务。卸载面板时会一并移除。
