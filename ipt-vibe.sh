@@ -2,7 +2,8 @@
 set -uo pipefail
 
 APP_NAME="iptables Vibe Panel"
-VERSION="0.3.0"
+VERSION="0.3.1"
+RAW_BASE="${IPT_VIBE_RAW_BASE:-https://raw.githubusercontent.com/bear4f/iptables-vibe-panel/main}"
 STATE_DIR="/etc/ipt-vibe-panel"
 RULES_FILE="$STATE_DIR/rules.conf"
 BACKUP_DIR="$STATE_DIR/backups"
@@ -302,12 +303,47 @@ backup_restore(){
 }
 uninstall_panel(){ clear; line; echo -e "${CYAN}卸载面板${RESET}"; line; local clean; read_tty clean "是否同时删除本工具管理的 iptables 规则？[y/N]: " || clean=""; if [ "$clean" = "y" ] || [ "$clean" = "Y" ]; then backup_rules >/dev/null; delete_managed_iptables_rules; save_persistent >/dev/null; fi; if command -v systemctl >/dev/null 2>&1 && [ -f /etc/systemd/system/ipt-vibe-restore.service ]; then systemctl disable --now ipt-vibe-restore.service >/dev/null 2>&1 || true; rm -f /etc/systemd/system/ipt-vibe-restore.service; systemctl daemon-reload >/dev/null 2>&1 || true; fi; rm -f /etc/cron.d/ipt-vibe-restore; rm -f /usr/local/bin/ipt-vibe /usr/local/bin/zf; echo -e "${GREEN}命令已移除。配置目录保留：$STATE_DIR${RESET}"; pause; }
 
+# 自更新：从 GitHub 拉取最新 ipt-vibe.sh 覆盖当前命令。
+# 下载后先做校验（非空 + bash 语法 + 含 VERSION 标记），避免半截/被劫持的文件把面板写坏。
+# 用「同目录临时文件 + 原子 mv」替换，保证正在运行的脚本读的是旧 inode，替换过程安全。
+update_panel(){
+  clear; line; echo -e "${CYAN}更新到最新版${RESET}"; line
+  if ! command -v curl >/dev/null 2>&1; then echo -e "${RED}未找到 curl，请先用菜单 1 安装依赖。${RESET}"; pause; return; fi
+  local target dir tmp new_ver yn
+  target="/usr/local/bin/ipt-vibe"; [ -e "$target" ] || target=$(command -v ipt-vibe 2>/dev/null || echo "$target")
+  dir=$(dirname "$target"); tmp="$dir/.ipt-vibe.update.$$"
+  echo -e "当前版本：${GREEN}v$VERSION${RESET}"
+  echo -e "${YELLOW}正在下载：$RAW_BASE/ipt-vibe.sh${RESET}"
+  if ! curl -fsSL "$RAW_BASE/ipt-vibe.sh" -o "$tmp" 2>/dev/null; then
+    echo -e "${RED}下载失败，请检查网络或 GitHub 连通性。原版本未改动。${RESET}"; rm -f "$tmp"; pause; return
+  fi
+  if [ ! -s "$tmp" ] || ! bash -n "$tmp" 2>/dev/null || ! grep -q '^VERSION=' "$tmp"; then
+    echo -e "${RED}下载内容无效或语法异常，已放弃更新。原版本未改动。${RESET}"; rm -f "$tmp"; pause; return
+  fi
+  new_ver=$(awk -F'"' '/^VERSION=/{print $2; exit}' "$tmp")
+  echo -e "最新版本：${GREEN}v$new_ver${RESET}"
+  if [ "$new_ver" = "$VERSION" ]; then
+    read_tty yn "已是最新版本，仍要强制覆盖安装？[y/N]: " || yn=""
+    case "$yn" in y|Y) ;; *) rm -f "$tmp"; echo "已取消。"; pause; return;; esac
+  fi
+  mkdir -p "$STATE_DIR" 2>/dev/null; cp -f "$target" "$STATE_DIR/ipt-vibe.prev" 2>/dev/null || true
+  chmod 0755 "$tmp" 2>/dev/null || true
+  if ! mv -f "$tmp" "$target"; then
+    echo -e "${RED}写入 $target 失败，请确认以 root 运行。${RESET}"; rm -f "$tmp"; pause; return
+  fi
+  ln -sf "$target" /usr/local/bin/zf 2>/dev/null || true
+  log "update $VERSION -> $new_ver"
+  echo -e "${GREEN}已更新到 v$new_ver（旧版本备份：$STATE_DIR/ipt-vibe.prev）。${RESET}"
+  echo -e "${YELLOW}即将以新版本重启面板...${RESET}"; sleep 1
+  exec "$target"
+}
+
 header(){ clear; line; echo -e "${CYAN}              $APP_NAME v$VERSION${RESET}"; line; echo -e "当前时间：${YELLOW}$(date '+%F %T')${RESET}"; echo -e "系统版本：${GREEN}$(os_name)${RESET}"; echo -e "内核版本：${GREEN}$(uname -r)${RESET}"; echo -e "iptables：${GREEN}$(iptables_backend)${RESET}"; echo -e "IPv4转发：${GREEN}$(ip_forward_status)${RESET}"; echo -e "连接跟踪：${GREEN}$(conntrack_status)${RESET} | 内存 ${GREEN}$(mem_status)${RESET}"; echo -e "规则数量：${GREEN}$(managed_count)${RESET} | 启用 ${GREEN}$(enabled_count)${RESET}"; echo -e "面板类型：${GREEN}SSH 终端菜单，不开放 HTTP 端口${RESET}"; line; }
 main_menu(){
   need_root; ensure_dirs
   while true; do
     header
-    echo "1. 安装/检查依赖"; echo "2. 添加转发规则"; echo "3. 查看转发规则"; echo "4. 修改转发规则"; echo "5. 删除转发规则"; echo "6. 应用规则到 iptables"; echo "7. 查看当前 iptables 规则"; echo "8. 备份与恢复"; echo "9. 卸载面板命令"; echo "0. 退出"; short_line
+    echo "1. 安装/检查依赖"; echo "2. 添加转发规则"; echo "3. 查看转发规则"; echo "4. 修改转发规则"; echo "5. 删除转发规则"; echo "6. 应用规则到 iptables"; echo "7. 查看当前 iptables 规则"; echo "8. 备份与恢复"; echo "9. 卸载面板命令"; echo "10. 更新到最新版"; echo "0. 退出"; short_line
     local choice
     if ! read_tty choice "请输入选项: "; then
       echo; echo -e "${RED}未检测到可交互键盘输入。请在 SSH 终端里直接运行：sudo zf${RESET}"; exit 1
@@ -315,7 +351,7 @@ main_menu(){
     choice=$(trim "$choice")
     [ -z "$choice" ] && continue
     case "$choice" in
-      1) install_deps;; 2) add_rule;; 3) list_rules;; 4) edit_rule;; 5) delete_rule;; 6) apply_rules;; 7) show_current_iptables;; 8) backup_restore;; 9) uninstall_panel;; 0) exit 0;; *) echo "无效选项：$choice"; sleep 1;;
+      1) install_deps;; 2) add_rule;; 3) list_rules;; 4) edit_rule;; 5) delete_rule;; 6) apply_rules;; 7) show_current_iptables;; 8) backup_restore;; 9) uninstall_panel;; 10) update_panel;; 0) exit 0;; *) echo "无效选项：$choice"; sleep 1;;
     esac
   done
 }
