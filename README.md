@@ -36,7 +36,15 @@ sudo zf
 
 ## 当前版本
 
-当前脚本版本：`v0.3.1`
+当前脚本版本：`v0.4.0`
+
+`v0.4.0` 聚焦「转发更稳不丢包」和「保护转发机不被 GFW 审查」：
+
+- **TCP MSS 钳制（防大包黑洞丢包）**：应用规则时自动在 `mangle FORWARD` 加一条 `TCPMSS --clamp-mss-to-pmtu`，按路径 MTU 修正 TCP 握手通告的 MSS。中转机到落地机若经隧道/不同 MTU 链路，大包常因 PMTU 黑洞被丢弃，表现为网页打不开、大文件卡住、SSH 卡死。钳制后这类丢包基本消除。
+- **连接跟踪表按内存自动扩容 + 加大哈希桶**：旧版只缩短超时，高并发时仍可能 `nf_conntrack: table full` 丢包。新版按物理内存自动计算 `nf_conntrack_max`（约每条 300 字节，范围 65536–1048576，小内存不 OOM、大内存不丢包），并把哈希桶 `hashsize` 同步放大（写 `/sys` 并落 `modprobe.d`，重启后仍生效）。
+- **`tcp_be_liberal=1`（减少误判丢包）**：中转链路常见非对称/乱序，默认窗口跟踪会把窗口外的正常包判为 `INVALID` 丢弃。开启宽松模式后不再误杀，转发更稳。
+- **UDP/VPN 超时放宽**：`udp_timeout` 30→60、`udp_timeout_stream` 120→180，减少 keepalive 间隙丢失 NAT 映射导致的重连/丢包。
+- **来源白名单（保护转发机不被 GFW 主动探测）**：每条规则可填「仅允许的来源 IP/CIDR」（逗号分隔，留空=允许所有）。填入客户端/家宽 IP 后，只有白名单来源才会被 DNAT 转发，其他来源在入口就被拒绝，落到中转机的关闭端口——GFW/扫描器的主动探测无法命中代理端口，大幅降低中转机被识别封锁的概率。
 
 `v0.3.1` 新增：
 
@@ -59,7 +67,7 @@ sudo zf
 进入面板后，顶部应显示：
 
 ```text
-iptables Vibe Panel v0.3.1
+iptables Vibe Panel v0.4.0
 ```
 
 如果仍显示旧版本，请重新执行一键安装命令。
@@ -82,6 +90,8 @@ iptables Vibe Panel v0.3.1
 - 支持 TCP、UDP、TCP+UDP。
 - 支持单端口和等长端口段转发。
 - 支持目标 IPv4 或域名，应用规则时自动解析域名。
+- 支持每条规则设置「来源白名单」（IP/CIDR，逗号分隔），只放行指定来源，躲避 GFW/扫描器主动探测。
+- 自动 MSS 钳制、conntrack 自动扩容与调优，转发更稳、更少丢包。
 - 自动开启 IPv4 转发：`net.ipv4.ip_forward=1`。
 - 应用前备份当前 `iptables-save` 输出。
 - 只管理带 `ipt-vibe:` 标记的规则，不主动删除其他手工规则。
@@ -98,6 +108,18 @@ iptables Vibe Panel v0.3.1
 -A POSTROUTING -d 198.51.100.10/32 -p udp --dport 10773 -m comment --comment "ipt-vibe:规则ID" -j MASQUERADE
 -A FORWARD -d 198.51.100.10/32 -p tcp --dport 10773 -m comment --comment "ipt-vibe:规则ID" -j ACCEPT
 -A FORWARD -d 198.51.100.10/32 -p udp --dport 10773 -m comment --comment "ipt-vibe:规则ID" -j ACCEPT
+```
+
+此外 `mangle` 表会有一条全局 MSS 钳制规则（防大包黑洞丢包）：
+
+```bash
+-A FORWARD -p tcp -m tcp --tcp-flags SYN,RST SYN -m comment --comment "ipt-vibe:mss" -j TCPMSS --clamp-mss-to-pmtu
+```
+
+如果该规则设置了来源白名单（例如只允许 `203.0.113.7`），DNAT 规则会带上 `-s`，非白名单来源不会被转发：
+
+```bash
+-A PREROUTING -s 203.0.113.7/32 -p tcp --dport 10773 -m comment --comment "ipt-vibe:规则ID" -j DNAT --to-destination 198.51.100.10:10773
 ```
 
 不应该再出现这种坏规则：
@@ -135,11 +157,12 @@ sudo zf
 
 1. 检查 root 权限、`iptables`、`iptables-save`。
 2. 开启 IPv4 转发：`net.ipv4.ip_forward=1`。
-3. 写入 conntrack 调优（缩短连接跟踪表过期时间，降低内存占用）。
+3. 写入 conntrack 调优：缩短过期时间降低内存占用，按内存自动扩容 `nf_conntrack_max` 与哈希桶、开启 `tcp_be_liberal` 减少丢包。
 4. 备份当前 `iptables-save` 输出（仅保留最近 10 份）。
 5. 删除所有带 `ipt-vibe:` 备注的旧规则。
-6. 根据面板状态库重建启用中的规则。
-7. 持久化并安装开机自动恢复：优先 `netfilter-persistent`；否则自动创建 systemd oneshot 服务 `ipt-vibe-restore.service`；再否则用 `cron @reboot` 兜底。这样重启或死机后规则会自动恢复，无需手动重新应用。
+6. 应用全局优化：`mangle FORWARD` 加 TCP MSS 钳制（`--clamp-mss-to-pmtu`）。
+7. 根据面板状态库重建启用中的规则（带来源白名单时只对白名单来源做 DNAT）。
+8. 持久化并安装开机自动恢复：优先 `netfilter-persistent`；否则自动创建 systemd oneshot 服务 `ipt-vibe-restore.service`；再否则用 `cron @reboot` 兜底。这样重启或死机后规则会自动恢复，无需手动重新应用。
 
 ## 常见问题
 
@@ -230,6 +253,35 @@ free -m
 sysctl -w net.netfilter.nf_conntrack_max=131072
 echo 'net.netfilter.nf_conntrack_max = 131072' > /etc/sysctl.d/99-ipt-vibe-ctmax.conf
 ```
+
+> v0.4.0 起 `nf_conntrack_max` 会按物理内存自动计算，一般无需手动设置。
+
+### 转发经常丢包 / 网页打不开、大文件卡住 / SSH 卡死（v0.4.0 已优化）
+
+多数是「大包被 PMTU 黑洞丢弃」或「连接跟踪表满/误判」导致。v0.4.0 应用规则时会自动：
+
+- 加 TCP MSS 钳制，按路径 MTU 修正握手 MSS，消除大包黑洞丢包；
+- 按内存自动扩容连接跟踪表并加大哈希桶，避免 `table full` 丢包；
+- 开启 `nf_conntrack_tcp_be_liberal`，避免中转链路乱序包被误判 `INVALID` 丢弃。
+
+排查命令：
+
+```bash
+# 确认 MSS 钳制规则已生效
+iptables -t mangle -S FORWARD | grep TCPMSS
+
+# 是否出现连接跟踪表满丢包
+dmesg | grep -i 'nf_conntrack: table full'
+
+# 查看当前 MTU（中转与落地两端对比，隧道链路常见 1400 左右）
+ip link | grep mtu
+```
+
+### 想让转发端口只对自己开放，躲避 GFW 主动探测
+
+在「添加/修改转发规则」时，把「仅允许的来源 IP/CIDR」填成你的客户端出口 IP（家宽公网 IP、其他服务器 IP，可多个用逗号）。填写后只有这些来源能被转发，GFW/扫描器扫到该端口时连接会被直接拒绝，无法探测代理特征。留空则和以前一样对所有来源开放。
+
+> 提示：家宽 IP 会变动，变了记得回面板更新白名单，否则自己也会被挡在外面。
 
 ## 常用命令
 

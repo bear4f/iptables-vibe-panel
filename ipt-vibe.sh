@@ -2,7 +2,7 @@
 set -uo pipefail
 
 APP_NAME="iptables Vibe Panel"
-VERSION="0.3.1"
+VERSION="0.4.0"
 RAW_BASE="${IPT_VIBE_RAW_BASE:-https://raw.githubusercontent.com/bear4f/iptables-vibe-panel/main}"
 STATE_DIR="/etc/ipt-vibe-panel"
 RULES_FILE="$STATE_DIR/rules.conf"
@@ -56,6 +56,21 @@ valid_ip4_or_empty(){
   IFS="$oldifs"
 }
 valid_host(){ local h="$1"; [ -n "$h" ] || return 1; echo "$h" | grep -Eq '^[A-Za-z0-9._-]+$' || return 1; echo "$h" | grep -Eq '(^-|-$|\.\.)' && return 1; return 0; }
+# 来源白名单：逗号分隔的 IPv4 或 IPv4/CIDR，留空表示允许所有来源。
+valid_allow_or_empty(){
+  [ -z "$1" ] && return 0
+  local e ipp pfx o
+  for e in $(echo "$1" | tr ',' ' '); do
+    echo "$e" | grep -Eq '^([0-9]{1,3}\.){3}[0-9]{1,3}(/[0-9]{1,2})?$' || return 1
+    ipp="${e%%/*}"
+    case "$e" in */*) pfx="${e#*/}";; *) pfx=32;; esac
+    { [ "$pfx" -ge 0 ] && [ "$pfx" -le 32 ]; } 2>/dev/null || return 1
+    local oldifs="$IFS"; IFS='.'
+    for o in $ipp; do { [ "$o" -ge 0 ] && [ "$o" -le 255 ]; } 2>/dev/null || { IFS="$oldifs"; return 1; }; done
+    IFS="$oldifs"
+  done
+  return 0
+}
 
 resolve_host(){
   local host="$1" ip=""
@@ -102,20 +117,41 @@ enable_forward(){
 # conntrack 调优：转发节点的内存主要消耗在内核连接跟踪表上。
 # 默认 tcp established 超时是 432000 秒（5 天），空闲连接会长期占用内存，
 # 高流量/UDP(VPN) 场景下连接跟踪表膨胀，容易触发 OOM 导致死机或重启。
-# 这里缩短过期时间，让陈旧连接尽快释放，从源头压低内存占用。
+# 这里缩短过期时间，让陈旧连接尽快释放，从源头压低内存占用；
+# 同时按内存自动扩容连接跟踪表并加大哈希桶，避免高并发时“table full”丢包。
 tune_conntrack(){
   modprobe nf_conntrack 2>/dev/null || true
   [ -d /etc/modules-load.d ] && echo 'nf_conntrack' > /etc/modules-load.d/ipt-vibe.conf 2>/dev/null || true
+
+  # 依据物理内存自动计算连接跟踪表上限：既避免高流量时“table full”导致丢包，
+  # 又不至于在小内存 VPS 上把内存吃满触发 OOM（每条连接约 300 字节）。
+  local ram_mb ctmax hashsize
+  ram_mb=$(awk '/MemTotal/{print int($2/1024)}' /proc/meminfo 2>/dev/null)
+  { [ -n "$ram_mb" ] && [ "$ram_mb" -gt 0 ] 2>/dev/null; } || ram_mb=1024
+  ctmax=$((ram_mb*256))
+  [ "$ctmax" -lt 65536 ] && ctmax=65536
+  [ "$ctmax" -gt 1048576 ] && ctmax=1048576
+  hashsize=$((ctmax/8)); [ "$hashsize" -lt 16384 ] && hashsize=16384
+
+  # hashsize 是模块参数（非 sysctl）：加大哈希桶可缩短冲突链、加快查表，
+  # 降低高并发下的查找开销与丢包。live 写入 /sys，并落 modprobe.d 让重启后仍生效。
+  echo "$hashsize" > /sys/module/nf_conntrack/parameters/hashsize 2>/dev/null || true
+  [ -d /etc/modprobe.d ] && echo "options nf_conntrack hashsize=$hashsize" > /etc/modprobe.d/ipt-vibe-conntrack.conf 2>/dev/null || true
+
   local f=/etc/sysctl.d/99-ipt-vibe-conntrack.conf
-  cat > "$f" <<'EOF'
-# ipt-vibe-panel: 转发节点 conntrack 调优，降低内存占用、加快连接过期回收
+  cat > "$f" <<EOF
+# ipt-vibe-panel: 转发节点 conntrack 调优，降低内存占用、加快连接过期回收、减少丢包
+net.netfilter.nf_conntrack_max = $ctmax
+# 中转链路常见非对称/乱序，be_liberal=1 避免把窗口外的正常包误判为 INVALID 而丢弃
+net.netfilter.nf_conntrack_tcp_be_liberal = 1
 net.netfilter.nf_conntrack_tcp_timeout_established = 86400
 net.netfilter.nf_conntrack_tcp_timeout_time_wait = 30
 net.netfilter.nf_conntrack_tcp_timeout_close_wait = 30
 net.netfilter.nf_conntrack_tcp_timeout_fin_wait = 30
 net.netfilter.nf_conntrack_generic_timeout = 120
-net.netfilter.nf_conntrack_udp_timeout = 30
-net.netfilter.nf_conntrack_udp_timeout_stream = 120
+# UDP/VPN 依赖 NAT 映射存活，超时略放宽，减少 keepalive 间隙丢失映射导致的重连/丢包
+net.netfilter.nf_conntrack_udp_timeout = 60
+net.netfilter.nf_conntrack_udp_timeout_stream = 180
 EOF
   sysctl -p "$f" >/dev/null 2>&1 || true
 }
@@ -190,10 +226,18 @@ delete_chain_by_comment(){
   done
 }
 
+# 应用一批全局（与单条规则无关）的转发优化规则。
+# MSS 钳制：按路径 MTU 修正 TCP 三次握手时通告的 MSS，避免大包在中转/隧道
+# 链路上因 PMTU 黑洞被丢弃，导致 TCP 卡死/丢包（网页打不开、大文件卡住的常见根因）。
+apply_global_rules(){
+  iptables -t mangle -A FORWARD -p tcp --tcp-flags SYN,RST SYN -m comment --comment "${TAG}mss" -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true
+}
+
 delete_managed_iptables_rules(){
   command -v iptables >/dev/null 2>&1 || return 0
   delete_chain_by_comment nat PREROUTING
   delete_chain_by_comment nat POSTROUTING
+  delete_chain_by_comment mangle FORWARD
   delete_chain_by_comment "" FORWARD
   command -v iptables-save >/dev/null 2>&1 || return 0
   iptables-save | grep -- "$TAG" | grep '^-A ' | while IFS= read -r rule; do
@@ -205,18 +249,24 @@ delete_managed_iptables_rules(){
 }
 
 add_rule_to_iptables(){
-  local id="$1" listen_ip="$2" ls="$3" le="$4" target_host="$5" ts="$6" te="$7" protos="$8"
-  local ip mark lp tp target proto pre
+  local id="$1" listen_ip="$2" ls="$3" le="$4" target_host="$5" ts="$6" te="$7" protos="$8" allow="${9:-}"
+  local ip mark lp tp target proto pre fwd
   ip=$(resolve_host "$target_host") || { echo -e "${RED}目标解析失败：$target_host${RESET}"; return 1; }
   [ -n "$ip" ] || { echo -e "${RED}目标解析为空：$target_host${RESET}"; return 1; }
   echo -e "${CYAN}解析：$target_host -> $ip${RESET}"
+  [ -n "$allow" ] && echo -e "${CYAN}来源限制：仅 $allow 可访问${RESET}"
   mark="${TAG}${id}"; lp=$(port_match "$ls" "$le"); tp=$(port_match "$ts" "$te"); target=$(dnat_target "$ip" "$ts" "$te")
   for proto in $(echo "$protos" | tr ',' ' '); do
+    # 只对白名单来源做 DNAT：非白名单流量在入口就不被转发，
+    # 落到中转机本地的关闭端口（连接被拒），躲避 GFW/扫描器对代理端口的主动探测。
     pre="iptables -t nat -A PREROUTING -p $proto"
     [ -n "$listen_ip" ] && pre="$pre -d $listen_ip"
+    [ -n "$allow" ] && pre="$pre -s $allow"
     $pre --dport "$lp" -m comment --comment "$mark" -j DNAT --to-destination "$target" || return 1
     iptables -t nat -A POSTROUTING -p "$proto" -d "$ip" --dport "$tp" -m comment --comment "$mark" -j MASQUERADE || return 1
-    iptables -A FORWARD -p "$proto" -d "$ip" --dport "$tp" -m comment --comment "$mark" -j ACCEPT || return 1
+    fwd="iptables -A FORWARD -p $proto -d $ip --dport $tp"
+    [ -n "$allow" ] && fwd="$fwd -s $allow"
+    $fwd -m comment --comment "$mark" -j ACCEPT || return 1
     iptables -A FORWARD -p "$proto" -s "$ip" --sport "$tp" -m conntrack --ctstate ESTABLISHED,RELATED -m comment --comment "$mark" -j ACCEPT || true
   done
   awk -F'|' -v id="$id" -v ip="$ip" 'BEGIN{OFS="|"} $1==id{$11=ip} {print}' "$RULES_FILE" > "$RULES_FILE.tmp" && mv "$RULES_FILE.tmp" "$RULES_FILE"
@@ -229,9 +279,10 @@ apply_rules(){
   local bak saved ok=0 fail=0
   bak=$(backup_rules); [ -n "$bak" ] && echo -e "${YELLOW}已备份：$bak${RESET}"
   delete_managed_iptables_rules
-  while IFS='|' read -r id name enabled listen_ip ls le target_host ts te protos resolved; do
+  apply_global_rules
+  while IFS='|' read -r id name enabled listen_ip ls le target_host ts te protos resolved allow; do
     [ -z "$id" ] && continue; [ "$enabled" = "1" ] || continue
-    if add_rule_to_iptables "$id" "$listen_ip" "$ls" "$le" "$target_host" "$ts" "$te" "$protos"; then ok=$((ok+1)); else echo -e "${RED}应用失败：$name ($target_host)${RESET}"; fail=$((fail+1)); fi
+    if add_rule_to_iptables "$id" "$listen_ip" "$ls" "$le" "$target_host" "$ts" "$te" "$protos" "$allow"; then ok=$((ok+1)); else echo -e "${RED}应用失败：$name ($target_host)${RESET}"; fail=$((fail+1)); fi
   done < "$RULES_FILE"
   saved=$(save_persistent)
   echo -e "${GREEN}完成：成功 $ok，失败 $fail。持久化：$saved${RESET}"
@@ -241,19 +292,19 @@ apply_rules(){
 list_rules(){
   clear; line; echo -e "${CYAN}转发规则列表${RESET}"; line; ensure_dirs
   if ! grep -q '^[^#[:space:]]' "$RULES_FILE"; then echo -e "${YELLOW}暂无规则。${RESET}"; pause; return; fi
-  printf "%-4s %-8s %-18s %-25s %-9s %-15s %s\n" "序号" "状态" "入口" "目标" "协议" "解析IP" "名称"; short_line
+  printf "%-4s %-6s %-18s %-24s %-8s %-14s %-16s %s\n" "序号" "状态" "入口" "目标" "协议" "解析IP" "来源限制" "名称"; short_line
   local n=1 st lip lport tport
-  while IFS='|' read -r id name enabled listen_ip ls le target_host ts te protos resolved; do
+  while IFS='|' read -r id name enabled listen_ip ls le target_host ts te protos resolved allow; do
     [ -z "$id" ] && continue
     [ "$enabled" = "1" ] && st="启用" || st="停用"; lip=${listen_ip:-0.0.0.0}; lport=$(port_label "$ls" "$le"); tport=$(port_label "$ts" "$te")
-    printf "%-4s %-8s %-18s %-25s %-9s %-15s %s\n" "$n" "$st" "$lip:$lport" "$target_host:$tport" "$protos" "${resolved:-无}" "$name"
+    printf "%-4s %-6s %-18s %-24s %-8s %-14s %-16s %s\n" "$n" "$st" "$lip:$lport" "$target_host:$tport" "$protos" "${resolved:-无}" "${allow:-全部}" "$name"
     n=$((n+1))
   done < "$RULES_FILE"; pause
 }
 
 read_default(){ local prompt="$1" def="${2:-}" val=""; if [ -n "$def" ]; then read_tty val "$prompt [$def]: " || return 1; RD="${val:-$def}"; else read_tty val "$prompt: " || return 1; RD="$val"; fi; RD=$(trim "$RD"); }
 collect_rule_fields(){
-  local old_name="$1" old_enabled="$2" old_lip="$3" old_ls="$4" old_le="$5" old_host="$6" old_ts="$7" old_te="$8" old_protos="$9" pc dc ec
+  local old_name="$1" old_enabled="$2" old_lip="$3" old_ls="$4" old_le="$5" old_host="$6" old_ts="$7" old_te="$8" old_protos="$9" old_allow="${10:-}" pc dc ec
   read_default "规则名称" "$old_name" || return 1; R_NAME="$RD"
   read_default "监听 IP，留空表示全部" "$old_lip" || return 1; R_LIP="$RD"
   read_default "入口起始端口" "$old_ls" || return 1; R_LS="$RD"
@@ -264,8 +315,10 @@ collect_rule_fields(){
   echo "协议：1) TCP  2) UDP  3) TCP+UDP"; dc="3"; [ "$old_protos" = "tcp" ] && dc="1"; [ "$old_protos" = "udp" ] && dc="2"
   read_default "请选择协议" "$dc" || return 1; pc="$RD"
   case "$pc" in 1|tcp|TCP) R_PROTOS="tcp";; 2|udp|UDP) R_PROTOS="udp";; 3|both|BOTH|all|ALL) R_PROTOS="tcp,udp";; *) echo -e "${RED}协议无效。${RESET}"; return 1;; esac
+  read_default "仅允许的来源 IP/CIDR，逗号分隔，留空=允许所有（建议填客户端/家宽IP，躲避GFW主动探测）" "$old_allow" || return 1; R_ALLOW="$RD"
   read_default "是否启用？1启用/0停用" "${old_enabled:-1}" || return 1; ec="$RD"
   case "$ec" in 1|y|Y|yes|YES|on|ON) R_ENABLED="1";; 0|n|N|no|NO|off|OFF) R_ENABLED="0";; *) echo -e "${RED}状态无效。${RESET}"; return 1;; esac
+  valid_allow_or_empty "$R_ALLOW" || { echo -e "${RED}来源白名单格式无效（示例：1.2.3.4 或 1.2.3.0/24，多个用逗号）。${RESET}"; return 1; }
   valid_ip4_or_empty "$R_LIP" || { echo -e "${RED}监听 IP 无效。${RESET}"; return 1; }
   valid_port "$R_LS" || { echo -e "${RED}入口端口无效。${RESET}"; return 1; }
   valid_port "$R_LE" || { echo -e "${RED}入口结束端口无效。${RESET}"; return 1; }
@@ -277,18 +330,18 @@ collect_rule_fields(){
   [ -n "$R_NAME" ] || R_NAME="${R_LS}-to-${R_HOST}-${R_TS}"
 }
 
-add_rule(){ clear; line; echo -e "${CYAN}添加转发规则${RESET}"; line; ensure_dirs; collect_rule_fields "" "1" "" "" "" "" "" "" "tcp,udp" || { pause; return; }; local id; id=$(next_id); echo "$id|$R_NAME|$R_ENABLED|$R_LIP|$R_LS|$R_LE|$R_HOST|$R_TS|$R_TE|$R_PROTOS|" >> "$RULES_FILE"; echo -e "${GREEN}规则已添加。选择“应用规则”后生效。${RESET}"; pause; }
+add_rule(){ clear; line; echo -e "${CYAN}添加转发规则${RESET}"; line; ensure_dirs; collect_rule_fields "" "1" "" "" "" "" "" "" "tcp,udp" "" || { pause; return; }; local id; id=$(next_id); echo "$id|$R_NAME|$R_ENABLED|$R_LIP|$R_LS|$R_LE|$R_HOST|$R_TS|$R_TE|$R_PROTOS||$R_ALLOW" >> "$RULES_FILE"; echo -e "${GREEN}规则已添加。选择“应用规则”后生效。${RESET}"; pause; }
 select_rule_id(){
   ensure_dirs; grep -q '^[^#[:space:]]' "$RULES_FILE" || { echo -e "${YELLOW}暂无规则。${RESET}"; return 1; }
   local n=1 choice
-  while IFS='|' read -r id name enabled listen_ip ls le target_host ts te protos resolved; do [ -z "$id" ] && continue; echo "$n) $name  $target_host:$ts  [$protos]"; n=$((n+1)); done < "$RULES_FILE"
+  while IFS='|' read -r id name enabled listen_ip ls le target_host ts te protos resolved allow; do [ -z "$id" ] && continue; echo "$n) $name  $target_host:$ts  [$protos]"; n=$((n+1)); done < "$RULES_FILE"
   read_tty choice "请选择序号: " || return 1; choice=$(trim "$choice"); echo "$choice" | grep -Eq '^[0-9]+$' || return 1
   n=1
-  while IFS='|' read -r id name enabled listen_ip ls le target_host ts te protos resolved; do [ -z "$id" ] && continue; if [ "$n" -eq "$choice" ]; then SELECTED_LINE="$id|$name|$enabled|$listen_ip|$ls|$le|$target_host|$ts|$te|$protos|$resolved"; return 0; fi; n=$((n+1)); done < "$RULES_FILE"
+  while IFS='|' read -r id name enabled listen_ip ls le target_host ts te protos resolved allow; do [ -z "$id" ] && continue; if [ "$n" -eq "$choice" ]; then SELECTED_LINE="$id|$name|$enabled|$listen_ip|$ls|$le|$target_host|$ts|$te|$protos|$resolved|$allow"; return 0; fi; n=$((n+1)); done < "$RULES_FILE"
   return 1
 }
 delete_rule(){ clear; line; echo -e "${CYAN}删除转发规则${RESET}"; line; select_rule_id || { echo -e "${RED}选择无效。${RESET}"; pause; return; }; local id name yn; IFS='|' read -r id name _ <<< "$SELECTED_LINE"; read_tty yn "确认删除 $name ? [y/N]: " || yn=""; case "$yn" in y|Y) awk -F'|' -v id="$id" '$1 != id {print}' "$RULES_FILE" > "$RULES_FILE.tmp" && mv "$RULES_FILE.tmp" "$RULES_FILE"; echo -e "${GREEN}已删除配置。选择“应用规则”后同步到系统。${RESET}";; *) echo "已取消。";; esac; pause; }
-edit_rule(){ clear; line; echo -e "${CYAN}修改转发规则${RESET}"; line; select_rule_id || { echo -e "${RED}选择无效。${RESET}"; pause; return; }; local id name enabled lip ls le host ts te protos resolved; IFS='|' read -r id name enabled lip ls le host ts te protos resolved <<< "$SELECTED_LINE"; collect_rule_fields "$name" "$enabled" "$lip" "$ls" "$le" "$host" "$ts" "$te" "$protos" || { pause; return; }; awk -F'|' -v id="$id" -v newline="$id|$R_NAME|$R_ENABLED|$R_LIP|$R_LS|$R_LE|$R_HOST|$R_TS|$R_TE|$R_PROTOS|$resolved" 'BEGIN{OFS="|"} $1==id{print newline; next} {print}' "$RULES_FILE" > "$RULES_FILE.tmp" && mv "$RULES_FILE.tmp" "$RULES_FILE"; echo -e "${GREEN}规则已修改。选择“应用规则”后生效。${RESET}"; pause; }
+edit_rule(){ clear; line; echo -e "${CYAN}修改转发规则${RESET}"; line; select_rule_id || { echo -e "${RED}选择无效。${RESET}"; pause; return; }; local id name enabled lip ls le host ts te protos resolved allow; IFS='|' read -r id name enabled lip ls le host ts te protos resolved allow <<< "$SELECTED_LINE"; collect_rule_fields "$name" "$enabled" "$lip" "$ls" "$le" "$host" "$ts" "$te" "$protos" "$allow" || { pause; return; }; awk -F'|' -v id="$id" -v newline="$id|$R_NAME|$R_ENABLED|$R_LIP|$R_LS|$R_LE|$R_HOST|$R_TS|$R_TE|$R_PROTOS|$resolved|$R_ALLOW" 'BEGIN{OFS="|"} $1==id{print newline; next} {print}' "$RULES_FILE" > "$RULES_FILE.tmp" && mv "$RULES_FILE.tmp" "$RULES_FILE"; echo -e "${GREEN}规则已修改。选择“应用规则”后生效。${RESET}"; pause; }
 show_current_iptables(){ clear; line; echo -e "${CYAN}当前本工具管理的 iptables 规则${RESET}"; line; iptables-save 2>/dev/null | grep -- "$TAG" || echo -e "${YELLOW}当前系统中没有本工具管理的规则。${RESET}"; pause; }
 backup_restore(){
   clear; line; echo -e "${CYAN}备份与恢复${RESET}"; line
