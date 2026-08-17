@@ -2,7 +2,7 @@
 set -uo pipefail
 
 APP_NAME="iptables Vibe Panel"
-VERSION="0.4.0"
+VERSION="0.4.1"
 RAW_BASE="${IPT_VIBE_RAW_BASE:-https://raw.githubusercontent.com/bear4f/iptables-vibe-panel/main}"
 STATE_DIR="/etc/ipt-vibe-panel"
 RULES_FILE="$STATE_DIR/rules.conf"
@@ -272,6 +272,112 @@ add_rule_to_iptables(){
   awk -F'|' -v id="$id" -v ip="$ip" 'BEGIN{OFS="|"} $1==id{$11=ip} {print}' "$RULES_FILE" > "$RULES_FILE.tmp" && mv "$RULES_FILE.tmp" "$RULES_FILE"
 }
 
+# 删除单条规则（按其唯一备注 ipt-vibe:ID）在 nat/filter 表里的所有条目。
+# 用于 DDNS 刷新时“只替换 IP 变了的这一条”，不影响其它规则。
+delete_iptables_by_mark(){
+  local mark="$1" spec table chain num
+  for spec in "nat PREROUTING" "nat POSTROUTING" "filter FORWARD"; do
+    set -- $spec; table="$1"; chain="$2"
+    while :; do
+      num=$(iptables -t "$table" -L "$chain" --line-numbers -n 2>/dev/null | awk -v m="$mark" 'index($0,m){print $1; exit}')
+      [ -n "$num" ] || break
+      iptables -t "$table" -D "$chain" "$num" >/dev/null 2>&1 || break
+    done
+  done
+}
+
+# 是否存在“启用中且目标是域名（非纯 IPv4）”的规则。
+# 纯 IPv4 只含数字和点；域名一定含字母/下划线/连字符。
+# 用字符类判断而非区间量词 {n,m}，兼容 Debian 默认的 mawk（不支持区间正则）。
+has_domain_rule(){
+  awk -F'|' '$3=="1" && $7 ~ /[A-Za-z_-]/ {found=1} END{exit found?0:1}' "$RULES_FILE" 2>/dev/null
+}
+
+self_bin(){ local b="/usr/local/bin/ipt-vibe"; [ -x "$b" ] || b=$(command -v ipt-vibe 2>/dev/null || echo "$b"); echo "$b"; }
+DDNS_INTERVAL_MIN=2
+
+ddns_status(){
+  if { command -v systemctl >/dev/null 2>&1 && systemctl is-enabled ipt-vibe-ddns.timer >/dev/null 2>&1; } || [ -f /etc/cron.d/ipt-vibe-ddns ]; then
+    echo "开启（每${DDNS_INTERVAL_MIN}分钟）"
+  else
+    echo "关闭"
+  fi
+}
+
+# 安装“域名目标自动刷新”定时任务：iptables DNAT 只能写死 IP，无法跟随域名变化。
+# DDNS 家宽 IP 变化后，若不重新解析并改写 DNAT，转发会一直指向旧 IP 而失效。
+# 这里用 systemd timer（无则 cron 兜底）周期性执行 `ipt-vibe --refresh-ddns`。
+ensure_ddns_timer(){
+  local bin; bin=$(self_bin)
+  if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
+    cat > /etc/systemd/system/ipt-vibe-ddns.service <<EOF
+[Unit]
+Description=ipt-vibe-panel DDNS refresh (re-resolve domain targets and update DNAT)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=$bin --refresh-ddns
+EOF
+    cat > /etc/systemd/system/ipt-vibe-ddns.timer <<EOF
+[Unit]
+Description=Periodically refresh ipt-vibe-panel domain (DDNS) targets
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=${DDNS_INTERVAL_MIN}min
+AccuracySec=15s
+
+[Install]
+WantedBy=timers.target
+EOF
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    systemctl enable --now ipt-vibe-ddns.timer >/dev/null 2>&1 || true
+    echo "systemd timer"
+  elif [ -d /etc/cron.d ]; then
+    printf '*/%s * * * * root %s --refresh-ddns >/dev/null 2>&1\n' "$DDNS_INTERVAL_MIN" "$bin" > /etc/cron.d/ipt-vibe-ddns
+    chmod 0644 /etc/cron.d/ipt-vibe-ddns 2>/dev/null || true
+    echo "cron @${DDNS_INTERVAL_MIN}min"
+  else
+    echo "无法安装（缺少 systemd/cron）"
+  fi
+}
+
+remove_ddns_timer(){
+  if command -v systemctl >/dev/null 2>&1 && [ -f /etc/systemd/system/ipt-vibe-ddns.timer ]; then
+    systemctl disable --now ipt-vibe-ddns.timer >/dev/null 2>&1 || true
+    rm -f /etc/systemd/system/ipt-vibe-ddns.timer /etc/systemd/system/ipt-vibe-ddns.service
+    systemctl daemon-reload >/dev/null 2>&1 || true
+  fi
+  rm -f /etc/cron.d/ipt-vibe-ddns 2>/dev/null || true
+}
+
+# 非交互模式（由定时器调用）：逐条检查域名目标，只有解析出的 IP 与上次记录不同时，
+# 才删除并重建这一条规则。解析失败/无变化时不动任何规则，避免误伤正常转发。
+refresh_ddns(){
+  need_root; ensure_dirs
+  command -v iptables >/dev/null 2>&1 || exit 0
+  local id name enabled listen_ip ls le target_host ts te protos resolved allow newip changed=0
+  while IFS='|' read -r id name enabled listen_ip ls le target_host ts te protos resolved allow; do
+    [ -z "$id" ] && continue
+    [ "$enabled" = "1" ] || continue
+    echo "$target_host" | grep -Eq '^([0-9]{1,3}\.){3}[0-9]{1,3}$' && continue
+    newip=$(resolve_host "$target_host" 2>/dev/null) || continue
+    [ -n "$newip" ] || continue
+    [ "$newip" = "$resolved" ] && continue
+    log "ddns change: $name $target_host $resolved -> $newip"
+    delete_iptables_by_mark "${TAG}${id}"
+    if add_rule_to_iptables "$id" "$listen_ip" "$ls" "$le" "$target_host" "$ts" "$te" "$protos" "$allow" >/dev/null 2>&1; then
+      changed=1
+    else
+      log "ddns reapply failed: $name ($target_host)"
+    fi
+  done < "$RULES_FILE"
+  if [ "$changed" = "1" ]; then save_persistent >/dev/null 2>&1 || true; log "ddns refresh persisted"; fi
+  exit 0
+}
+
 apply_rules(){
   clear; line; echo -e "${CYAN}应用转发规则${RESET}"; line
   if ! command -v iptables >/dev/null 2>&1 || ! command -v iptables-save >/dev/null 2>&1; then echo -e "${RED}iptables 或 iptables-save 不可用，请先安装依赖。${RESET}"; pause; return; fi
@@ -286,6 +392,12 @@ apply_rules(){
   done < "$RULES_FILE"
   saved=$(save_persistent)
   echo -e "${GREEN}完成：成功 $ok，失败 $fail。持久化：$saved${RESET}"
+  # 有域名目标时启用自动刷新（跟随 DDNS 变化改写 DNAT）；全是纯 IP 则关闭，避免多余定时任务。
+  if has_domain_rule; then
+    echo -e "${GREEN}域名目标自动刷新：已启用（$(ensure_ddns_timer)，每 ${DDNS_INTERVAL_MIN} 分钟检查一次）${RESET}"
+  else
+    remove_ddns_timer
+  fi
   log "apply ok=$ok fail=$fail"; pause
 }
 
@@ -354,7 +466,7 @@ backup_restore(){
   esac
   pause
 }
-uninstall_panel(){ clear; line; echo -e "${CYAN}卸载面板${RESET}"; line; local clean; read_tty clean "是否同时删除本工具管理的 iptables 规则？[y/N]: " || clean=""; if [ "$clean" = "y" ] || [ "$clean" = "Y" ]; then backup_rules >/dev/null; delete_managed_iptables_rules; save_persistent >/dev/null; fi; if command -v systemctl >/dev/null 2>&1 && [ -f /etc/systemd/system/ipt-vibe-restore.service ]; then systemctl disable --now ipt-vibe-restore.service >/dev/null 2>&1 || true; rm -f /etc/systemd/system/ipt-vibe-restore.service; systemctl daemon-reload >/dev/null 2>&1 || true; fi; rm -f /etc/cron.d/ipt-vibe-restore; rm -f /usr/local/bin/ipt-vibe /usr/local/bin/zf; echo -e "${GREEN}命令已移除。配置目录保留：$STATE_DIR${RESET}"; pause; }
+uninstall_panel(){ clear; line; echo -e "${CYAN}卸载面板${RESET}"; line; local clean; read_tty clean "是否同时删除本工具管理的 iptables 规则？[y/N]: " || clean=""; if [ "$clean" = "y" ] || [ "$clean" = "Y" ]; then backup_rules >/dev/null; delete_managed_iptables_rules; save_persistent >/dev/null; fi; if command -v systemctl >/dev/null 2>&1 && [ -f /etc/systemd/system/ipt-vibe-restore.service ]; then systemctl disable --now ipt-vibe-restore.service >/dev/null 2>&1 || true; rm -f /etc/systemd/system/ipt-vibe-restore.service; systemctl daemon-reload >/dev/null 2>&1 || true; fi; rm -f /etc/cron.d/ipt-vibe-restore; remove_ddns_timer; rm -f /usr/local/bin/ipt-vibe /usr/local/bin/zf; echo -e "${GREEN}命令已移除。配置目录保留：$STATE_DIR${RESET}"; pause; }
 
 # 自更新：从 GitHub 拉取最新 ipt-vibe.sh 覆盖当前命令。
 # 下载后先做校验（非空 + bash 语法 + 含 VERSION 标记），避免半截/被劫持的文件把面板写坏。
@@ -391,7 +503,7 @@ update_panel(){
   exec "$target"
 }
 
-header(){ clear; line; echo -e "${CYAN}              $APP_NAME v$VERSION${RESET}"; line; echo -e "当前时间：${YELLOW}$(date '+%F %T')${RESET}"; echo -e "系统版本：${GREEN}$(os_name)${RESET}"; echo -e "内核版本：${GREEN}$(uname -r)${RESET}"; echo -e "iptables：${GREEN}$(iptables_backend)${RESET}"; echo -e "IPv4转发：${GREEN}$(ip_forward_status)${RESET}"; echo -e "连接跟踪：${GREEN}$(conntrack_status)${RESET} | 内存 ${GREEN}$(mem_status)${RESET}"; echo -e "规则数量：${GREEN}$(managed_count)${RESET} | 启用 ${GREEN}$(enabled_count)${RESET}"; echo -e "面板类型：${GREEN}SSH 终端菜单，不开放 HTTP 端口${RESET}"; line; }
+header(){ clear; line; echo -e "${CYAN}              $APP_NAME v$VERSION${RESET}"; line; echo -e "当前时间：${YELLOW}$(date '+%F %T')${RESET}"; echo -e "系统版本：${GREEN}$(os_name)${RESET}"; echo -e "内核版本：${GREEN}$(uname -r)${RESET}"; echo -e "iptables：${GREEN}$(iptables_backend)${RESET}"; echo -e "IPv4转发：${GREEN}$(ip_forward_status)${RESET}"; echo -e "连接跟踪：${GREEN}$(conntrack_status)${RESET} | 内存 ${GREEN}$(mem_status)${RESET}"; echo -e "规则数量：${GREEN}$(managed_count)${RESET} | 启用 ${GREEN}$(enabled_count)${RESET}"; echo -e "域名(DDNS)自动刷新：${GREEN}$(ddns_status)${RESET}"; echo -e "面板类型：${GREEN}SSH 终端菜单，不开放 HTTP 端口${RESET}"; line; }
 main_menu(){
   need_root; ensure_dirs
   while true; do
@@ -408,4 +520,8 @@ main_menu(){
     esac
   done
 }
+# 非交互子命令：由 DDNS 定时器调用，不进入菜单。
+case "${1:-}" in
+  --refresh-ddns|refresh-ddns) refresh_ddns;;
+esac
 main_menu
