@@ -2,19 +2,17 @@
 set -uo pipefail
 
 APP_NAME="iptables Vibe Panel"
-VERSION="0.5.0"
+VERSION="0.6.0"
 RAW_BASE="${IPT_VIBE_RAW_BASE:-https://raw.githubusercontent.com/bear4f/iptables-vibe-panel/main}"
 STATE_DIR="/etc/ipt-vibe-panel"
 RULES_FILE="$STATE_DIR/rules.conf"
 BACKUP_DIR="$STATE_DIR/backups"
 LOG_FILE="$STATE_DIR/panel.log"
 TAG="ipt-vibe:"
-
-# Realm 用户态双栈转发引擎（用于 IPv6 入口、IPv6->IPv4 跨族转发，iptables DNAT 做不到）。
-REALM_VERSION="${IPT_VIBE_REALM_VERSION:-v2.9.6}"
-REALM_BIN="/usr/local/bin/realm"
-REALM_CONF="$STATE_DIR/realm.toml"
-REALM_SERVICE="ipt-vibe-realm.service"
+# 兼容清理：v0.5.0 曾用 Realm 引擎，升级到纯 iptables 双栈后要移除它遗留的服务/二进制/配置。
+LEGACY_REALM_BIN="/usr/local/bin/realm"
+LEGACY_REALM_SERVICE="ipt-vibe-realm.service"
+LEGACY_REALM_CONF="$STATE_DIR/realm.toml"
 
 RED='\033[31m'; GREEN='\033[32m'; YELLOW='\033[33m'; BLUE='\033[34m'; CYAN='\033[36m'; RESET='\033[0m'
 
@@ -92,32 +90,54 @@ valid_allow_or_empty(){
 allow_v4(){ local e out=""; for e in $(echo "$1" | tr ',' ' '); do case "$e" in *:*) ;; *) out="${out:+$out,}$e";; esac; done; echo "$out"; }
 allow_v6(){ local e out=""; for e in $(echo "$1" | tr ',' ' '); do case "$e" in *:*) out="${out:+$out,}$e";; esac; done; echo "$out"; }
 
+have_ip6tables(){ command -v ip6tables >/dev/null 2>&1; }
 # 本机是否有全局可路由的公网 IPv6（排除 fe80 链路本地与 fc00::/7 ULA）。
 has_public_ipv6(){
   ip -6 addr show scope global 2>/dev/null | awk '/inet6/{print $2}' \
     | grep -Eqv '^(fe80|fc|fd)' 2>/dev/null
 }
-# 本机主用 IPv4 是否为私网/CGNAT（说明在 NAT 后面，iptables DNAT 收不到外部到公网 IP 的流量）。
-ipv4_is_nat(){
-  local ip
-  ip=$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}')
-  [ -n "$ip" ] || ip=$(ip -4 addr show scope global 2>/dev/null | awk '/inet /{print $2}' | head -1 | cut -d/ -f1)
-  [ -n "$ip" ] || return 1
-  echo "$ip" | grep -Eq '^(10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[01])\.|100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.)'
-}
+ip6_forward_status(){ [ "$(cat /proc/sys/net/ipv6/conf/all/forwarding 2>/dev/null || echo 0)" = "1" ] && echo "已开启" || echo "未开启"; }
 
+# 把目标/监听解析成 IPv4。target 为 IPv4 直接返回；域名走 A 记录。
 resolve_host(){
   local host="$1" ip=""
-  if echo "$host" | grep -Eq '^([0-9]{1,3}\.){3}[0-9]{1,3}$'; then echo "$host"; return 0; fi
+  if is_ipv4 "$host"; then echo "$host"; return 0; fi
   if command -v getent >/dev/null 2>&1; then
     ip=$(getent ahostsv4 "$host" 2>/dev/null | awk '{print $1; exit}')
-    echo "$ip" | grep -Eq '^([0-9]{1,3}\.){3}[0-9]{1,3}$' && { echo "$ip"; return 0; }
+    is_ipv4 "$ip" && { echo "$ip"; return 0; }
   fi
   if command -v host >/dev/null 2>&1; then
     ip=$(host -t A "$host" 2>/dev/null | awk '/has address/ {print $4; exit}')
-    echo "$ip" | grep -Eq '^([0-9]{1,3}\.){3}[0-9]{1,3}$' && { echo "$ip"; return 0; }
+    is_ipv4 "$ip" && { echo "$ip"; return 0; }
   fi
   return 1
+}
+# 把目标/监听解析成 IPv6。target 为 IPv6 直接返回；域名走 AAAA 记录。
+resolve_host6(){
+  local host="$1" ip=""
+  if is_ipv6 "$host"; then echo "$host"; return 0; fi
+  if command -v getent >/dev/null 2>&1; then
+    ip=$(getent ahostsv6 "$host" 2>/dev/null | awk '{print $1; exit}')
+    is_ipv6 "$ip" && { echo "$ip"; return 0; }
+  fi
+  if command -v host >/dev/null 2>&1; then
+    ip=$(host -t AAAA "$host" 2>/dev/null | awk '/has IPv6 address/ {print $NF; exit}')
+    is_ipv6 "$ip" && { echo "$ip"; return 0; }
+  fi
+  return 1
+}
+# 判断单条规则走哪个地址族：6=IPv6(ip6tables)，4=IPv4(iptables)。
+# 监听或目标是 IPv6 字面量 -> v6；目标是 IPv4 字面量 -> v4；
+# 域名按“监听族优先”，否则先看 A 记录再看 AAAA。
+rule_family(){
+  local lip="$1" th="$2"
+  is_ipv6 "$lip" && { echo 6; return; }
+  is_ipv6 "$th" && { echo 6; return; }
+  is_ipv4 "$th" && { echo 4; return; }
+  if is_ipv4 "$lip"; then echo 4; return; fi
+  resolve_host  "$th" >/dev/null 2>&1 && { echo 4; return; }
+  resolve_host6 "$th" >/dev/null 2>&1 && { echo 6; return; }
+  echo 4
 }
 
 next_id(){ date +%s%N | cut -c1-12; }
@@ -138,12 +158,14 @@ install_deps(){
 
 enable_forward(){
   echo 1 > /proc/sys/net/ipv4/ip_forward 2>/dev/null || true
+  # 同时开启 IPv6 转发（双栈：ip6tables 的 v6->v6 DNAT 也需要内核转发）。
+  echo 1 > /proc/sys/net/ipv6/conf/all/forwarding 2>/dev/null || true
   if [ -d /etc/sysctl.d ]; then
-    echo 'net.ipv4.ip_forward=1' > /etc/sysctl.d/99-ipt-vibe-panel.conf
+    { echo 'net.ipv4.ip_forward=1'; echo 'net.ipv6.conf.all.forwarding=1'; } > /etc/sysctl.d/99-ipt-vibe-panel.conf
   else
     touch /etc/sysctl.conf
-    sed -i '/^\s*#\?\s*net\.ipv4\.ip_forward\s*=/d' /etc/sysctl.conf
-    echo 'net.ipv4.ip_forward=1' >> /etc/sysctl.conf
+    sed -i '/^\s*#\?\s*net\.ipv4\.ip_forward\s*=/d;/^\s*#\?\s*net\.ipv6\.conf\.all\.forwarding\s*=/d' /etc/sysctl.conf
+    { echo 'net.ipv4.ip_forward=1'; echo 'net.ipv6.conf.all.forwarding=1'; } >> /etc/sysctl.conf
   fi
   sysctl -p >/dev/null 2>&1 || true
 }
@@ -271,209 +293,81 @@ delete_chain_by_comment(){
 # MSS 钳制：按路径 MTU 修正 TCP 三次握手时通告的 MSS，避免大包在中转/隧道
 # 链路上因 PMTU 黑洞被丢弃，导致 TCP 卡死/丢包（网页打不开、大文件卡住的常见根因）。
 apply_global_rules(){
-  iptables -t mangle -A FORWARD -p tcp --tcp-flags SYN,RST SYN -m comment --comment "${TAG}mss" -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true
+  iptables  -t mangle -A FORWARD -p tcp --tcp-flags SYN,RST SYN -m comment --comment "${TAG}mss" -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true
+  have_ip6tables && ip6tables -t mangle -A FORWARD -p tcp --tcp-flags SYN,RST SYN -m comment --comment "${TAG}mss" -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true
 }
 
+# 清理本工具在 iptables 与 ip6tables（nat/filter/mangle）里打了标记的所有规则。
 delete_managed_iptables_rules(){
   command -v iptables >/dev/null 2>&1 || return 0
-  delete_chain_by_comment nat PREROUTING
-  delete_chain_by_comment nat POSTROUTING
-  delete_chain_by_comment mangle FORWARD
-  delete_chain_by_comment "" FORWARD
-  delete_chain_by_comment "" INPUT
-  # Realm 白名单可能在 ip6tables INPUT 上留有规则，一并清理。
-  delete_chain_by_comment "" INPUT ip6tables
-  command -v iptables-save >/dev/null 2>&1 || return 0
-  iptables-save | grep -- "$TAG" | grep '^-A ' | while IFS= read -r rule; do
-    local chain del_rule
-    chain=$(echo "$rule" | awk '{print $2}')
-    del_rule=$(echo "$rule" | sed 's/^-A /-D /')
-    if [ "$chain" = "PREROUTING" ] || [ "$chain" = "POSTROUTING" ]; then iptables -t nat $del_rule >/dev/null 2>&1 || true; else iptables $del_rule >/dev/null 2>&1 || true; fi
+  local cmd
+  for cmd in iptables ip6tables; do
+    command -v "$cmd" >/dev/null 2>&1 || continue
+    delete_chain_by_comment nat PREROUTING "$cmd"
+    delete_chain_by_comment nat POSTROUTING "$cmd"
+    delete_chain_by_comment mangle FORWARD "$cmd"
+    delete_chain_by_comment "" FORWARD "$cmd"
+    delete_chain_by_comment "" INPUT "$cmd"
   done
 }
 
+# 按规则地址族用 iptables(v4) 或 ip6tables(v6) 建立 DNAT/MASQUERADE/FORWARD。
+# 同族转发（v4->v4 / v6->v6），跨族（v6->v4）内核做不到，会在此明确报错。
 add_rule_to_iptables(){
   local id="$1" listen_ip="$2" ls="$3" le="$4" target_host="$5" ts="$6" te="$7" protos="$8" allow="${9:-}"
-  local ip mark lp tp target proto pre fwd
-  ip=$(resolve_host "$target_host") || { echo -e "${RED}目标解析失败：$target_host${RESET}"; return 1; }
+  local fam ipt ip ipd mark lp tp target al proto pre fwd
+  fam=$(rule_family "$listen_ip" "$target_host")
+  if [ "$fam" = 6 ]; then
+    have_ip6tables || { echo -e "${RED}目标为 IPv6 但系统无 ip6tables，请先用菜单 1 安装依赖。${RESET}"; return 1; }
+    ipt="ip6tables"; ip=$(resolve_host6 "$target_host") || { echo -e "${RED}目标 IPv6(AAAA) 解析失败：$target_host${RESET}"; return 1; }
+    al=$(allow_v6 "$allow")
+  else
+    ipt="iptables"; ip=$(resolve_host "$target_host") || { echo -e "${RED}目标 IPv4(A) 解析失败：$target_host${RESET}"; return 1; }
+    al=$(allow_v4 "$allow")
+  fi
   [ -n "$ip" ] || { echo -e "${RED}目标解析为空：$target_host${RESET}"; return 1; }
-  echo -e "${CYAN}解析：$target_host -> $ip${RESET}"
-  [ -n "$allow" ] && echo -e "${CYAN}来源限制：仅 $allow 可访问${RESET}"
-  mark="${TAG}${id}"; lp=$(port_match "$ls" "$le"); tp=$(port_match "$ts" "$te"); target=$(dnat_target "$ip" "$ts" "$te")
+  # 跨族防呆：监听族与目标族不一致（例如 IPv6 监听 -> IPv4 目标）iptables 无法完成。
+  if [ -n "$listen_ip" ]; then
+    { [ "$fam" = 6 ] && is_ipv6 "$listen_ip"; } || { [ "$fam" = 4 ] && ! is_ipv6 "$listen_ip"; } || {
+      echo -e "${RED}监听与目标地址族不一致（iptables 不支持跨族 NAT64，请两端同族）。${RESET}"; return 1; }
+  fi
+  echo -e "${CYAN}解析[v$fam]：$target_host -> $ip${RESET}"
+  [ -n "$al" ] && echo -e "${CYAN}来源限制：仅 $al 可访问${RESET}"
+  mark="${TAG}${id}"; lp=$(port_match "$ls" "$le"); tp=$(port_match "$ts" "$te")
+  # DNAT --to-destination：IPv6 需用 [addr]:port 形式。
+  if [ "$fam" = 6 ]; then target=$(dnat_target "[$ip]" "$ts" "$te"); else target=$(dnat_target "$ip" "$ts" "$te"); fi
   for proto in $(echo "$protos" | tr ',' ' '); do
-    # 只对白名单来源做 DNAT：非白名单流量在入口就不被转发，
-    # 落到中转机本地的关闭端口（连接被拒），躲避 GFW/扫描器对代理端口的主动探测。
-    pre="iptables -t nat -A PREROUTING -p $proto"
+    # 只对白名单来源做 DNAT：非白名单流量在入口就不被转发，落到本地关闭端口，
+    # 躲避 GFW/扫描器对代理端口的主动探测。
+    pre="$ipt -t nat -A PREROUTING -p $proto"
     [ -n "$listen_ip" ] && pre="$pre -d $listen_ip"
-    [ -n "$allow" ] && pre="$pre -s $allow"
+    [ -n "$al" ] && pre="$pre -s $al"
     $pre --dport "$lp" -m comment --comment "$mark" -j DNAT --to-destination "$target" || return 1
-    iptables -t nat -A POSTROUTING -p "$proto" -d "$ip" --dport "$tp" -m comment --comment "$mark" -j MASQUERADE || return 1
-    fwd="iptables -A FORWARD -p $proto -d $ip --dport $tp"
-    [ -n "$allow" ] && fwd="$fwd -s $allow"
+    $ipt -t nat -A POSTROUTING -p "$proto" -d "$ip" --dport "$tp" -m comment --comment "$mark" -j MASQUERADE || return 1
+    fwd="$ipt -A FORWARD -p $proto -d $ip --dport $tp"
+    [ -n "$al" ] && fwd="$fwd -s $al"
     $fwd -m comment --comment "$mark" -j ACCEPT || return 1
-    iptables -A FORWARD -p "$proto" -s "$ip" --sport "$tp" -m conntrack --ctstate ESTABLISHED,RELATED -m comment --comment "$mark" -j ACCEPT || true
+    $ipt -A FORWARD -p "$proto" -s "$ip" --sport "$tp" -m conntrack --ctstate ESTABLISHED,RELATED -m comment --comment "$mark" -j ACCEPT || true
   done
   awk -F'|' -v id="$id" -v ip="$ip" 'BEGIN{OFS="|"} $1==id{$11=ip} {print}' "$RULES_FILE" > "$RULES_FILE.tmp" && mv "$RULES_FILE.tmp" "$RULES_FILE"
 }
 
-# ============================ Realm 双栈引擎 ============================
-# iptables DNAT 只能在同一地址族内转发（IPv4->IPv4），无法处理 IPv6 入口或
-# IPv6->IPv4 跨族。Realm 是用户态 socket relay：监听 [::] 同时接受 IPv4/IPv6，
-# 再主动向目标（IPv4 或 IPv6）建立连接，天然完成跨族转发。
-have_ip6tables(){ command -v ip6tables >/dev/null 2>&1; }
-realm_installed(){ [ -x "$REALM_BIN" ]; }
-realm_running(){ command -v systemctl >/dev/null 2>&1 && systemctl is-active "$REALM_SERVICE" >/dev/null 2>&1; }
-realm_status(){
-  if ! realm_installed; then echo "未安装"; return; fi
-  if realm_running; then echo "运行中（$("$REALM_BIN" -v 2>/dev/null | awk '{print $2}')）"; else echo "已安装未运行"; fi
-}
-realm_arch_triple(){
-  case "$(uname -m)" in
-    x86_64|amd64) echo "x86_64-unknown-linux-musl";;
-    aarch64|arm64) echo "aarch64-unknown-linux-musl";;
-    armv7l|armv7|armhf) echo "armv7-unknown-linux-musleabihf";;
-    *) return 1;;
-  esac
-}
-install_realm(){
-  local quiet="${1:-}" triple url tmp
-  triple=$(realm_arch_triple) || { [ -z "$quiet" ] && echo -e "${RED}不支持的 CPU 架构：$(uname -m)${RESET}"; return 1; }
-  command -v curl >/dev/null 2>&1 || { [ -z "$quiet" ] && echo -e "${RED}未找到 curl，请先用菜单 1 安装依赖。${RESET}"; return 1; }
-  mkdir -p "$STATE_DIR"; tmp="$STATE_DIR/.realm.dl.$$"
-  url="https://github.com/zhboner/realm/releases/download/${REALM_VERSION}/realm-${triple}.tar.gz"
-  [ -z "$quiet" ] && echo -e "${YELLOW}正在下载 Realm ${REALM_VERSION}（${triple}）...${RESET}"
-  if ! curl -fsSL "$url" -o "$tmp.tgz" 2>/dev/null; then [ -z "$quiet" ] && echo -e "${RED}下载失败：$url${RESET}"; rm -f "$tmp.tgz"; return 1; fi
-  rm -f "$STATE_DIR/realm"
-  tar xzf "$tmp.tgz" -C "$STATE_DIR" realm 2>/dev/null || tar xzf "$tmp.tgz" -C "$STATE_DIR" 2>/dev/null || { rm -f "$tmp.tgz"; [ -z "$quiet" ] && echo -e "${RED}解压失败。${RESET}"; return 1; }
-  rm -f "$tmp.tgz"
-  [ -f "$STATE_DIR/realm" ] || { [ -z "$quiet" ] && echo -e "${RED}解压后未找到 realm 二进制。${RESET}"; return 1; }
-  chmod 0755 "$STATE_DIR/realm" 2>/dev/null || true
-  mv -f "$STATE_DIR/realm" "$REALM_BIN" || { [ -z "$quiet" ] && echo -e "${RED}安装到 $REALM_BIN 失败（需 root）。${RESET}"; return 1; }
-  [ -z "$quiet" ] && echo -e "${GREEN}Realm 已就绪：$("$REALM_BIN" -v 2>/dev/null | head -1)${RESET}"
-  log "realm installed ${REALM_VERSION}"; return 0
-}
-install_realm_menu(){ clear; line; echo -e "${CYAN}安装/更新 Realm 双栈引擎${RESET}"; line; need_root; install_realm; pause; }
-
-# 决定单条规则实际使用哪个引擎：auto 时按“目标族 + 本机能力”自动判断。
-effective_engine(){
-  local eng="$1" target="$2" listen_ip="$3"
-  [ "$eng" = "iptables" ] && { echo "iptables"; return; }
-  [ "$eng" = "realm" ] && { echo "realm"; return; }
-  # auto：
-  is_ipv6 "$target" && { echo "realm"; return; }          # 目标是 IPv6 -> iptables 跨不了族
-  is_ipv6 "$listen_ip" && { echo "realm"; return; }        # 指定 IPv6 监听
-  # 本机在 NAT/CGNAT IPv4 之后（或没有 IPv4 出口）但有公网 IPv6 -> 走 realm 用 IPv6 入口
-  if has_public_ipv6 && { ipv4_is_nat || ! ip -4 route get 1.1.1.1 >/dev/null 2>&1; }; then echo "realm"; return; fi
-  echo "iptables"   # 默认：IPv4 -> IPv4 走内核 DNAT，性能最好
-}
-
-# 累加 realm endpoint（支持等长端口段，逐端口展开）。结果追加到全局 REALM_ENDPOINTS。
-REALM_ENDPOINTS=""; REALM_UDP="false"
-realm_add_endpoints(){
-  local listen_ip="$1" ls="$2" le="$3" target_host="$4" ts="$5" protos="$6" name="$7"
-  local laddr raddr i lport tport
-  if [ -z "$listen_ip" ]; then laddr="[::]"; elif is_ipv6 "$listen_ip"; then laddr="[$listen_ip]"; else laddr="$listen_ip"; fi
-  if is_ipv6 "$target_host"; then raddr="[$target_host]"; else raddr="$target_host"; fi
-  case "$protos" in *udp*) REALM_UDP="true";; esac
-  i=0
-  while [ $((ls+i)) -le "$le" ]; do
-    lport=$((ls+i)); tport=$((ts+i))
-    REALM_ENDPOINTS="${REALM_ENDPOINTS}
-# ${name}
-[[endpoints]]
-listen = \"${laddr}:${lport}\"
-remote = \"${raddr}:${tport}\"
-"
-    i=$((i+1))
-  done
-}
-
-write_realm_config(){
-  ensure_dirs
-  {
-    echo "# 由 ipt-vibe-panel 自动生成，请勿手改（重新“应用规则”会覆盖）"
-    echo "[log]"; echo "level = \"warn\""; echo "output = \"stdout\""; echo
-    echo "[dns]"; echo "mode = \"ipv4_and_ipv6\""; echo "protocol = \"tcp_and_udp\""
-    echo "min_ttl = 60"; echo "max_ttl = 600"; echo
-    echo "[network]"; echo "no_tcp = false"; echo "use_udp = ${REALM_UDP}"
-    echo "tcp_timeout = 5"; echo "udp_timeout = 30"
-    printf '%s\n' "$REALM_ENDPOINTS"
-  } > "$REALM_CONF"
-}
-
-ensure_realm_service(){
-  if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
-    cat > "/etc/systemd/system/$REALM_SERVICE" <<EOF
-[Unit]
-Description=ipt-vibe-panel realm relay (dual-stack / IPv6 to IPv4)
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=simple
-ExecStart=$REALM_BIN -c $REALM_CONF
-Restart=on-failure
-RestartSec=3
-LimitNOFILE=1048576
-
-[Install]
-WantedBy=multi-user.target
-EOF
-    systemctl daemon-reload >/dev/null 2>&1 || true
-    systemctl enable "$REALM_SERVICE" >/dev/null 2>&1 || true
-    systemctl restart "$REALM_SERVICE" >/dev/null 2>&1 || true
-    realm_running && echo "systemd（运行中）" || echo "systemd（启动失败，看 journalctl -u $REALM_SERVICE）"
-  else
-    echo "无 systemd，无法常驻 realm（可改用 iptables 引擎）"
-  fi
-}
-stop_remove_realm_service(){
-  if command -v systemctl >/dev/null 2>&1 && [ -f "/etc/systemd/system/$REALM_SERVICE" ]; then
-    systemctl disable --now "$REALM_SERVICE" >/dev/null 2>&1 || true
-    rm -f "/etc/systemd/system/$REALM_SERVICE"; systemctl daemon-reload >/dev/null 2>&1 || true
-  fi
-  rm -f "$REALM_CONF" 2>/dev/null || true
-}
-
-# Realm 规则的来源白名单：realm 本身无 ACL，这里用 INPUT 防火墙限制监听端口。
-# 仅放行白名单来源（IPv4 用 iptables，IPv6 用 ip6tables），其余到该端口的新连接丢弃。
-apply_realm_firewall(){
-  local id="$1" listen_ip="$2" ls="$3" le="$4" protos="$5" allow="$6"
-  [ -n "$allow" ] || return 0
-  local mark="${TAG}${id}" proto lp v4 v6
-  lp=$(port_match "$ls" "$le"); v4=$(allow_v4 "$allow"); v6=$(allow_v6 "$allow")
-  for proto in $(echo "$protos" | tr ',' ' '); do
-    if command -v iptables >/dev/null 2>&1; then
-      [ -n "$v4" ] && iptables -A INPUT -p "$proto" --dport "$lp" -s "$v4" -m comment --comment "$mark" -j ACCEPT 2>/dev/null || true
-      iptables -A INPUT -p "$proto" --dport "$lp" -m comment --comment "$mark" -j DROP 2>/dev/null || true
-    fi
-    if have_ip6tables; then
-      [ -n "$v6" ] && ip6tables -A INPUT -p "$proto" --dport "$lp" -s "$v6" -m comment --comment "$mark" -j ACCEPT 2>/dev/null || true
-      ip6tables -A INPUT -p "$proto" --dport "$lp" -m comment --comment "$mark" -j DROP 2>/dev/null || true
-    fi
-  done
-}
-# ========================== Realm 双栈引擎 END ==========================
 
 # 删除单条规则（按其唯一备注 ipt-vibe:ID）在 nat/filter 表里的所有条目。
 # 用于 DDNS 刷新时“只替换 IP 变了的这一条”，不影响其它规则。
 delete_iptables_by_mark(){
-  local mark="$1" spec table chain num
-  for spec in "nat PREROUTING" "nat POSTROUTING" "filter FORWARD"; do
-    set -- $spec; table="$1"; chain="$2"
-    while :; do
-      num=$(iptables -t "$table" -L "$chain" --line-numbers -n 2>/dev/null | awk -v m="$mark" 'index($0,m){print $1; exit}')
-      [ -n "$num" ] || break
-      iptables -t "$table" -D "$chain" "$num" >/dev/null 2>&1 || break
+  local mark="$1" cmd spec table chain num
+  for cmd in iptables ip6tables; do
+    command -v "$cmd" >/dev/null 2>&1 || continue
+    for spec in "nat PREROUTING" "nat POSTROUTING" "filter FORWARD" "filter INPUT"; do
+      set -- $spec; table="$1"; chain="$2"
+      while :; do
+        num=$("$cmd" -t "$table" -L "$chain" --line-numbers -n 2>/dev/null | awk -v m="$mark" 'index($0,m){print $1; exit}')
+        [ -n "$num" ] || break
+        "$cmd" -t "$table" -D "$chain" "$num" >/dev/null 2>&1 || break
+      done
     done
   done
-}
-
-# 是否存在“启用中且目标是域名（非纯 IPv4）”的规则。
-# 纯 IPv4 只含数字和点；域名一定含字母/下划线/连字符。
-# 用字符类判断而非区间量词 {n,m}，兼容 Debian 默认的 mawk（不支持区间正则）。
-has_domain_rule(){
-  awk -F'|' '$3=="1" && $7 ~ /[A-Za-z_-]/ {found=1} END{exit found?0:1}' "$RULES_FILE" 2>/dev/null
 }
 
 self_bin(){ local b="/usr/local/bin/ipt-vibe"; [ -x "$b" ] || b=$(command -v ipt-vibe 2>/dev/null || echo "$b"); echo "$b"; }
@@ -541,17 +435,17 @@ remove_ddns_timer(){
 refresh_ddns(){
   need_root; ensure_dirs
   command -v iptables >/dev/null 2>&1 || exit 0
-  local id name enabled listen_ip ls le target_host ts te protos resolved allow newip changed=0
+  local id name enabled listen_ip ls le target_host ts te protos resolved allow fam newip changed=0
   while IFS='|' read -r id name enabled listen_ip ls le target_host ts te protos resolved allow engine; do
     [ -z "$id" ] && continue
     [ "$enabled" = "1" ] || continue
-    # 只处理 iptables 引擎的域名规则；realm 规则的 DNS 由 realm 自身按 TTL 重解析。
-    [ "$(effective_engine "${engine:-auto}" "$target_host" "$listen_ip")" = "iptables" ] || continue
-    echo "$target_host" | grep -Eq '^([0-9]{1,3}\.){3}[0-9]{1,3}$' && continue
-    newip=$(resolve_host "$target_host" 2>/dev/null) || continue
+    # 纯 IP 目标无需刷新；域名按其地址族重解析（v4 走 A，v6 走 AAAA）。
+    { is_ipv4 "$target_host" || is_ipv6 "$target_host"; } && continue
+    fam=$(rule_family "$listen_ip" "$target_host")
+    if [ "$fam" = 6 ]; then newip=$(resolve_host6 "$target_host" 2>/dev/null) || continue; else newip=$(resolve_host "$target_host" 2>/dev/null) || continue; fi
     [ -n "$newip" ] || continue
     [ "$newip" = "$resolved" ] && continue
-    log "ddns change: $name $target_host $resolved -> $newip"
+    log "ddns change: $name $target_host $resolved -> $newip (v$fam)"
     delete_iptables_by_mark "${TAG}${id}"
     if add_rule_to_iptables "$id" "$listen_ip" "$ls" "$le" "$target_host" "$ts" "$te" "$protos" "$allow" >/dev/null 2>&1; then
       changed=1
@@ -566,81 +460,68 @@ refresh_ddns(){
 apply_rules(){
   clear; line; echo -e "${CYAN}应用转发规则${RESET}"; line
   if ! command -v iptables >/dev/null 2>&1 || ! command -v iptables-save >/dev/null 2>&1; then echo -e "${RED}iptables 或 iptables-save 不可用，请先安装依赖。${RESET}"; pause; return; fi
-  ensure_dirs; enable_forward; tune_conntrack
-  local bak saved ok=0 fail=0 realm_ok=0 realm_needed=0 ipt_domain=0 eng
+  ensure_dirs; enable_forward; tune_conntrack; cleanup_legacy_realm
+  local bak saved ok=0 fail=0 v4=0 v6=0 ipt_domain=0 fam
   bak=$(backup_rules); [ -n "$bak" ] && echo -e "${YELLOW}已备份：$bak${RESET}"
   delete_managed_iptables_rules
   apply_global_rules
-  REALM_ENDPOINTS=""; REALM_UDP="false"
   while IFS='|' read -r id name enabled listen_ip ls le target_host ts te protos resolved allow engine; do
     [ -z "$id" ] && continue; [ "$enabled" = "1" ] || continue
-    eng=$(effective_engine "${engine:-auto}" "$target_host" "$listen_ip")
-    if [ "$eng" = "realm" ]; then
-      realm_add_endpoints "$listen_ip" "$ls" "$le" "$target_host" "$ts" "$protos" "$name"
-      apply_realm_firewall "$id" "$listen_ip" "$ls" "$le" "$protos" "$allow"
-      realm_needed=1; realm_ok=$((realm_ok+1))
-      echo -e "${CYAN}[realm] $name  ${listen_ip:-[::]}:$(port_label "$ls" "$le") -> $target_host:$(port_label "$ts" "$te")${RESET}"
-    else
-      if add_rule_to_iptables "$id" "$listen_ip" "$ls" "$le" "$target_host" "$ts" "$te" "$protos" "$allow"; then
-        ok=$((ok+1)); echo "$target_host" | grep -Eq '[A-Za-z_-]' && ipt_domain=1
-      else echo -e "${RED}应用失败：$name ($target_host)${RESET}"; fail=$((fail+1)); fi
-    fi
+    fam=$(rule_family "$listen_ip" "$target_host")
+    if add_rule_to_iptables "$id" "$listen_ip" "$ls" "$le" "$target_host" "$ts" "$te" "$protos" "$allow"; then
+      ok=$((ok+1)); [ "$fam" = 6 ] && v6=$((v6+1)) || v4=$((v4+1))
+      echo "$target_host" | grep -Eq '[A-Za-z_-]' && ipt_domain=1
+    else echo -e "${RED}应用失败：$name ($target_host)${RESET}"; fail=$((fail+1)); fi
   done < "$RULES_FILE"
   saved=$(save_persistent)
-  # Realm 引擎：有 realm 规则则（必要时自动安装）写配置并拉起服务；否则停用清理。
-  if [ "$realm_needed" = "1" ]; then
-    if ! realm_installed; then
-      echo -e "${YELLOW}检测到需要 Realm 双栈引擎，正在自动安装 ${REALM_VERSION}...${RESET}"
-      install_realm quiet || echo -e "${RED}Realm 自动安装失败，realm 规则暂未生效。可用菜单“安装 Realm”重试。${RESET}"
-    fi
-    if realm_installed; then
-      write_realm_config
-      echo -e "${GREEN}Realm 引擎：$(ensure_realm_service)，共 $realm_ok 条${RESET}"
-    fi
-  else
-    stop_remove_realm_service
-  fi
-  echo -e "${GREEN}完成：iptables 成功 $ok / 失败 $fail；realm $realm_ok。持久化：$saved${RESET}"
-  # DDNS 自动刷新只针对 iptables 引擎的域名规则（realm 由自身 DNS TTL 自动重解析）。
+  echo -e "${GREEN}完成：成功 $ok（IPv4 $v4 / IPv6 $v6）失败 $fail。持久化：$saved${RESET}"
+  # 域名目标启用 DDNS 自动刷新（v4/v6 都支持）；全是纯 IP 则关闭。
   if [ "$ipt_domain" = "1" ]; then
     echo -e "${GREEN}域名目标自动刷新：已启用（$(ensure_ddns_timer)，每 ${DDNS_INTERVAL_MIN} 分钟）${RESET}"
   else
     remove_ddns_timer
   fi
-  log "apply ipt_ok=$ok fail=$fail realm=$realm_ok"; pause
+  log "apply ok=$ok (v4=$v4 v6=$v6) fail=$fail"; pause
+}
+
+# 升级清理：把 v0.5.0 遗留的 Realm 服务/二进制/配置移除（现改用纯 iptables 双栈）。
+cleanup_legacy_realm(){
+  if command -v systemctl >/dev/null 2>&1 && [ -f "/etc/systemd/system/$LEGACY_REALM_SERVICE" ]; then
+    systemctl disable --now "$LEGACY_REALM_SERVICE" >/dev/null 2>&1 || true
+    rm -f "/etc/systemd/system/$LEGACY_REALM_SERVICE"; systemctl daemon-reload >/dev/null 2>&1 || true
+    log "removed legacy realm service"
+  fi
+  rm -f "$LEGACY_REALM_CONF" "$LEGACY_REALM_BIN" 2>/dev/null || true
 }
 
 list_rules(){
   clear; line; echo -e "${CYAN}转发规则列表${RESET}"; line; ensure_dirs
   if ! grep -q '^[^#[:space:]]' "$RULES_FILE"; then echo -e "${YELLOW}暂无规则。${RESET}"; pause; return; fi
-  printf "%-4s %-5s %-8s %-17s %-22s %-7s %-13s %s\n" "序号" "状态" "引擎" "入口" "目标" "协议" "来源限制" "名称"; short_line
-  local n=1 st lip lport tport eng
+  printf "%-4s %-5s %-5s %-18s %-24s %-7s %-13s %s\n" "序号" "状态" "族" "入口" "目标" "协议" "来源限制" "名称"; short_line
+  local n=1 st lip lport tport fam
   while IFS='|' read -r id name enabled listen_ip ls le target_host ts te protos resolved allow engine; do
     [ -z "$id" ] && continue
-    [ "$enabled" = "1" ] && st="启用" || st="停用"; lip=${listen_ip:-[::]}; lport=$(port_label "$ls" "$le"); tport=$(port_label "$ts" "$te")
-    eng="${engine:-auto}"; [ "$eng" = "auto" ] && eng="auto>$(effective_engine auto "$target_host" "$listen_ip")"
-    printf "%-4s %-5s %-8s %-17s %-22s %-7s %-13s %s\n" "$n" "$st" "$eng" "$lip:$lport" "$target_host:$tport" "$protos" "${allow:-全部}" "$name"
+    [ "$enabled" = "1" ] && st="启用" || st="停用"
+    { is_ipv6 "$listen_ip" || is_ipv6 "$target_host"; } && { fam="IPv6"; lip=${listen_ip:-[::]}; } || { fam="IPv4"; lip=${listen_ip:-0.0.0.0}; }
+    lport=$(port_label "$ls" "$le"); tport=$(port_label "$ts" "$te")
+    printf "%-4s %-5s %-5s %-18s %-24s %-7s %-13s %s\n" "$n" "$st" "$fam" "$lip:$lport" "$target_host:$tport" "$protos" "${allow:-全部}" "$name"
     n=$((n+1))
   done < "$RULES_FILE"; pause
 }
 
 read_default(){ local prompt="$1" def="${2:-}" val=""; if [ -n "$def" ]; then read_tty val "$prompt [$def]: " || return 1; RD="${val:-$def}"; else read_tty val "$prompt: " || return 1; RD="$val"; fi; RD=$(trim "$RD"); }
 collect_rule_fields(){
-  local old_name="$1" old_enabled="$2" old_lip="$3" old_ls="$4" old_le="$5" old_host="$6" old_ts="$7" old_te="$8" old_protos="$9" old_allow="${10:-}" old_engine="${11:-auto}" pc dc ec gc dg
+  local old_name="$1" old_enabled="$2" old_lip="$3" old_ls="$4" old_le="$5" old_host="$6" old_ts="$7" old_te="$8" old_protos="$9" old_allow="${10:-}" pc dc ec
   read_default "规则名称" "$old_name" || return 1; R_NAME="$RD"
-  read_default "监听 IP，留空=全部（IPv6 走 Realm 时留空即 [::] 双栈）" "$old_lip" || return 1; R_LIP="$RD"
+  read_default "监听 IP，留空=全部（v4=0.0.0.0 / v6=[::]，按目标族自动匹配）" "$old_lip" || return 1; R_LIP="$RD"
   read_default "入口起始端口" "$old_ls" || return 1; R_LS="$RD"
   read_default "入口结束端口，留空等于起始端口" "$old_le" || return 1; R_LE="${RD:-$R_LS}"
-  read_default "目标 IP/域名（可 IPv4/IPv6/域名）" "$old_host" || return 1; R_HOST="$RD"
+  read_default "目标 IP/域名（IPv4 / IPv6 / 域名，须与监听同族）" "$old_host" || return 1; R_HOST="$RD"
   read_default "目标起始端口" "$old_ts" || return 1; R_TS="$RD"
   read_default "目标结束端口，留空等于起始端口" "$old_te" || return 1; R_TE="${RD:-$R_TS}"
   echo "协议：1) TCP  2) UDP  3) TCP+UDP"; dc="3"; [ "$old_protos" = "tcp" ] && dc="1"; [ "$old_protos" = "udp" ] && dc="2"
   read_default "请选择协议" "$dc" || return 1; pc="$RD"
   case "$pc" in 1|tcp|TCP) R_PROTOS="tcp";; 2|udp|UDP) R_PROTOS="udp";; 3|both|BOTH|all|ALL) R_PROTOS="tcp,udp";; *) echo -e "${RED}协议无效。${RESET}"; return 1;; esac
-  echo "转发引擎：1) Auto(推荐)  2) Realm 双栈(IPv6 入口/IPv6→IPv4 跨族)  3) iptables(纯 IPv4 内核转发)"
-  dg="1"; [ "$old_engine" = "realm" ] && dg="2"; [ "$old_engine" = "iptables" ] && dg="3"
-  read_default "请选择转发引擎" "$dg" || return 1; gc="$RD"
-  case "$gc" in 1|auto|AUTO) R_ENGINE="auto";; 2|realm|Realm|REALM) R_ENGINE="realm";; 3|iptables|IPTABLES|ipt) R_ENGINE="iptables";; *) echo -e "${RED}引擎无效。${RESET}"; return 1;; esac
   read_default "仅允许的来源 IP/CIDR，逗号分隔，留空=允许所有（建议填客户端/家宽IP，躲避GFW主动探测）" "$old_allow" || return 1; R_ALLOW="$RD"
   read_default "是否启用？1启用/0停用" "${old_enabled:-1}" || return 1; ec="$RD"
   case "$ec" in 1|y|Y|yes|YES|on|ON) R_ENABLED="1";; 0|n|N|no|NO|off|OFF) R_ENABLED="0";; *) echo -e "${RED}状态无效。${RESET}"; return 1;; esac
@@ -653,26 +534,30 @@ collect_rule_fields(){
   valid_port "$R_TE" || { echo -e "${RED}目标结束端口无效。${RESET}"; return 1; }
   [ "$R_LS" -le "$R_LE" ] && [ "$R_TS" -le "$R_TE" ] || { echo -e "${RED}端口范围反了。${RESET}"; return 1; }
   [ $((R_LE-R_LS)) -eq $((R_TE-R_TS)) ] || { echo -e "${RED}入口端口段和目标端口段长度必须一致。${RESET}"; return 1; }
-  # iptables 引擎只能处理 IPv4；涉及 IPv6 时必须用 Realm/Auto。
-  if [ "$R_ENGINE" = "iptables" ] && { is_ipv6 "$R_HOST" || is_ipv6 "$R_LIP"; }; then
-    echo -e "${RED}iptables 引擎不支持 IPv6（跨族/IPv6 入口请选 Realm 或 Auto）。${RESET}"; return 1
+  # 同族校验：iptables/ip6tables 只能同族 NAT，监听与目标不能一个 IPv6 一个 IPv4。
+  if [ -n "$R_LIP" ] && is_ipv6 "$R_LIP" && is_ipv4 "$R_HOST"; then
+    echo -e "${RED}IPv6 监听不能转发到 IPv4 目标（iptables 不支持跨族 NAT64）。${RESET}"; return 1
   fi
+  if [ -n "$R_LIP" ] && ! is_ipv6 "$R_LIP" && [ "$R_LIP" != "" ] && is_ipv6 "$R_HOST"; then
+    echo -e "${RED}IPv4 监听不能转发到 IPv6 目标（iptables 不支持跨族 NAT64）。${RESET}"; return 1
+  fi
+  if is_ipv6 "$R_HOST" || is_ipv6 "$R_LIP"; then have_ip6tables || { echo -e "${RED}目标为 IPv6 但系统无 ip6tables，请先执行菜单 1 安装依赖。${RESET}"; return 1; }; fi
   [ -n "$R_NAME" ] || R_NAME="${R_LS}-to-${R_HOST}-${R_TS}"
 }
 
-add_rule(){ clear; line; echo -e "${CYAN}添加转发规则${RESET}"; line; ensure_dirs; collect_rule_fields "" "1" "" "" "" "" "" "" "tcp,udp" "" "auto" || { pause; return; }; local id; id=$(next_id); echo "$id|$R_NAME|$R_ENABLED|$R_LIP|$R_LS|$R_LE|$R_HOST|$R_TS|$R_TE|$R_PROTOS||$R_ALLOW|$R_ENGINE" >> "$RULES_FILE"; echo -e "${GREEN}规则已添加。选择“应用规则”后生效。${RESET}"; pause; }
+add_rule(){ clear; line; echo -e "${CYAN}添加转发规则${RESET}"; line; ensure_dirs; collect_rule_fields "" "1" "" "" "" "" "" "" "tcp,udp" "" || { pause; return; }; local id; id=$(next_id); echo "$id|$R_NAME|$R_ENABLED|$R_LIP|$R_LS|$R_LE|$R_HOST|$R_TS|$R_TE|$R_PROTOS||$R_ALLOW" >> "$RULES_FILE"; echo -e "${GREEN}规则已添加。选择“应用规则”后生效。${RESET}"; pause; }
 select_rule_id(){
   ensure_dirs; grep -q '^[^#[:space:]]' "$RULES_FILE" || { echo -e "${YELLOW}暂无规则。${RESET}"; return 1; }
   local n=1 choice
-  while IFS='|' read -r id name enabled listen_ip ls le target_host ts te protos resolved allow engine; do [ -z "$id" ] && continue; echo "$n) $name  $target_host:$ts  [$protos] [${engine:-auto}]"; n=$((n+1)); done < "$RULES_FILE"
+  while IFS='|' read -r id name enabled listen_ip ls le target_host ts te protos resolved allow engine; do [ -z "$id" ] && continue; echo "$n) $name  $target_host:$ts  [$protos]"; n=$((n+1)); done < "$RULES_FILE"
   read_tty choice "请选择序号: " || return 1; choice=$(trim "$choice"); echo "$choice" | grep -Eq '^[0-9]+$' || return 1
   n=1
-  while IFS='|' read -r id name enabled listen_ip ls le target_host ts te protos resolved allow engine; do [ -z "$id" ] && continue; if [ "$n" -eq "$choice" ]; then SELECTED_LINE="$id|$name|$enabled|$listen_ip|$ls|$le|$target_host|$ts|$te|$protos|$resolved|$allow|${engine:-auto}"; return 0; fi; n=$((n+1)); done < "$RULES_FILE"
+  while IFS='|' read -r id name enabled listen_ip ls le target_host ts te protos resolved allow engine; do [ -z "$id" ] && continue; if [ "$n" -eq "$choice" ]; then SELECTED_LINE="$id|$name|$enabled|$listen_ip|$ls|$le|$target_host|$ts|$te|$protos|$resolved|$allow"; return 0; fi; n=$((n+1)); done < "$RULES_FILE"
   return 1
 }
 delete_rule(){ clear; line; echo -e "${CYAN}删除转发规则${RESET}"; line; select_rule_id || { echo -e "${RED}选择无效。${RESET}"; pause; return; }; local id name yn; IFS='|' read -r id name _ <<< "$SELECTED_LINE"; read_tty yn "确认删除 $name ? [y/N]: " || yn=""; case "$yn" in y|Y) awk -F'|' -v id="$id" '$1 != id {print}' "$RULES_FILE" > "$RULES_FILE.tmp" && mv "$RULES_FILE.tmp" "$RULES_FILE"; echo -e "${GREEN}已删除配置。选择“应用规则”后同步到系统。${RESET}";; *) echo "已取消。";; esac; pause; }
-edit_rule(){ clear; line; echo -e "${CYAN}修改转发规则${RESET}"; line; select_rule_id || { echo -e "${RED}选择无效。${RESET}"; pause; return; }; local id name enabled lip ls le host ts te protos resolved allow engine; IFS='|' read -r id name enabled lip ls le host ts te protos resolved allow engine <<< "$SELECTED_LINE"; collect_rule_fields "$name" "$enabled" "$lip" "$ls" "$le" "$host" "$ts" "$te" "$protos" "$allow" "${engine:-auto}" || { pause; return; }; awk -F'|' -v id="$id" -v newline="$id|$R_NAME|$R_ENABLED|$R_LIP|$R_LS|$R_LE|$R_HOST|$R_TS|$R_TE|$R_PROTOS|$resolved|$R_ALLOW|$R_ENGINE" 'BEGIN{OFS="|"} $1==id{print newline; next} {print}' "$RULES_FILE" > "$RULES_FILE.tmp" && mv "$RULES_FILE.tmp" "$RULES_FILE"; echo -e "${GREEN}规则已修改。选择“应用规则”后生效。${RESET}"; pause; }
-show_current_iptables(){ clear; line; echo -e "${CYAN}当前本工具管理的 iptables 规则${RESET}"; line; iptables-save 2>/dev/null | grep -- "$TAG" || echo -e "${YELLOW}当前系统中没有本工具管理的规则。${RESET}"; pause; }
+edit_rule(){ clear; line; echo -e "${CYAN}修改转发规则${RESET}"; line; select_rule_id || { echo -e "${RED}选择无效。${RESET}"; pause; return; }; local id name enabled lip ls le host ts te protos resolved allow; IFS='|' read -r id name enabled lip ls le host ts te protos resolved allow <<< "$SELECTED_LINE"; collect_rule_fields "$name" "$enabled" "$lip" "$ls" "$le" "$host" "$ts" "$te" "$protos" "$allow" || { pause; return; }; awk -F'|' -v id="$id" -v newline="$id|$R_NAME|$R_ENABLED|$R_LIP|$R_LS|$R_LE|$R_HOST|$R_TS|$R_TE|$R_PROTOS|$resolved|$R_ALLOW" 'BEGIN{OFS="|"} $1==id{print newline; next} {print}' "$RULES_FILE" > "$RULES_FILE.tmp" && mv "$RULES_FILE.tmp" "$RULES_FILE"; echo -e "${GREEN}规则已修改。选择“应用规则”后生效。${RESET}"; pause; }
+show_current_iptables(){ clear; line; echo -e "${CYAN}当前本工具管理的规则（IPv4 + IPv6）${RESET}"; line; local v4 v6; v4=$(iptables-save 2>/dev/null | grep -- "$TAG"); v6=$(command -v ip6tables-save >/dev/null 2>&1 && ip6tables-save 2>/dev/null | grep -- "$TAG"); echo -e "${YELLOW}# IPv4 (iptables)${RESET}"; [ -n "$v4" ] && echo "$v4" || echo "  （无）"; echo -e "${YELLOW}# IPv6 (ip6tables)${RESET}"; [ -n "$v6" ] && echo "$v6" || echo "  （无）"; pause; }
 backup_restore(){
   clear; line; echo -e "${CYAN}备份与恢复${RESET}"; line
   echo "1) 立即备份当前 iptables"; echo "2) 查看备份文件"; echo "3) 从备份恢复"; echo "0) 返回"
@@ -684,7 +569,7 @@ backup_restore(){
   esac
   pause
 }
-uninstall_panel(){ clear; line; echo -e "${CYAN}卸载面板${RESET}"; line; local clean; read_tty clean "是否同时删除本工具管理的 iptables 规则？[y/N]: " || clean=""; if [ "$clean" = "y" ] || [ "$clean" = "Y" ]; then backup_rules >/dev/null; delete_managed_iptables_rules; save_persistent >/dev/null; fi; if command -v systemctl >/dev/null 2>&1 && [ -f /etc/systemd/system/ipt-vibe-restore.service ]; then systemctl disable --now ipt-vibe-restore.service >/dev/null 2>&1 || true; rm -f /etc/systemd/system/ipt-vibe-restore.service; systemctl daemon-reload >/dev/null 2>&1 || true; fi; rm -f /etc/cron.d/ipt-vibe-restore; remove_ddns_timer; stop_remove_realm_service; rm -f "$REALM_BIN"; rm -f /usr/local/bin/ipt-vibe /usr/local/bin/zf; echo -e "${GREEN}命令与 Realm 服务已移除。配置目录保留：$STATE_DIR${RESET}"; pause; }
+uninstall_panel(){ clear; line; echo -e "${CYAN}卸载面板${RESET}"; line; local clean; read_tty clean "是否同时删除本工具管理的 iptables 规则？[y/N]: " || clean=""; if [ "$clean" = "y" ] || [ "$clean" = "Y" ]; then backup_rules >/dev/null; delete_managed_iptables_rules; save_persistent >/dev/null; fi; if command -v systemctl >/dev/null 2>&1 && [ -f /etc/systemd/system/ipt-vibe-restore.service ]; then systemctl disable --now ipt-vibe-restore.service >/dev/null 2>&1 || true; rm -f /etc/systemd/system/ipt-vibe-restore.service; systemctl daemon-reload >/dev/null 2>&1 || true; fi; rm -f /etc/cron.d/ipt-vibe-restore; remove_ddns_timer; cleanup_legacy_realm; rm -f /usr/local/bin/ipt-vibe /usr/local/bin/zf; echo -e "${GREEN}命令已移除。配置目录保留：$STATE_DIR${RESET}"; pause; }
 
 # 自更新：从 GitHub 拉取最新 ipt-vibe.sh 覆盖当前命令。
 # 下载后先做校验（非空 + bash 语法 + 含 VERSION 标记），避免半截/被劫持的文件把面板写坏。
@@ -721,12 +606,12 @@ update_panel(){
   exec "$target"
 }
 
-header(){ clear; line; echo -e "${CYAN}              $APP_NAME v$VERSION${RESET}"; line; echo -e "当前时间：${YELLOW}$(date '+%F %T')${RESET}"; echo -e "系统版本：${GREEN}$(os_name)${RESET}"; echo -e "内核版本：${GREEN}$(uname -r)${RESET}"; echo -e "iptables：${GREEN}$(iptables_backend)${RESET}"; echo -e "IPv4转发：${GREEN}$(ip_forward_status)${RESET}"; echo -e "连接跟踪：${GREEN}$(conntrack_status)${RESET} | 内存 ${GREEN}$(mem_status)${RESET}"; echo -e "规则数量：${GREEN}$(managed_count)${RESET} | 启用 ${GREEN}$(enabled_count)${RESET}"; echo -e "域名(DDNS)自动刷新：${GREEN}$(ddns_status)${RESET}"; echo -e "Realm 双栈引擎：${GREEN}$(realm_status)${RESET} | 公网IPv6 ${GREEN}$(has_public_ipv6 && echo 有 || echo 无)${RESET}"; echo -e "面板类型：${GREEN}SSH 终端菜单，不开放 HTTP 端口${RESET}"; line; }
+header(){ clear; line; echo -e "${CYAN}              $APP_NAME v$VERSION${RESET}"; line; echo -e "当前时间：${YELLOW}$(date '+%F %T')${RESET}"; echo -e "系统版本：${GREEN}$(os_name)${RESET}"; echo -e "内核版本：${GREEN}$(uname -r)${RESET}"; echo -e "iptables：${GREEN}$(iptables_backend)${RESET} | ip6tables ${GREEN}$(have_ip6tables && echo 可用 || echo 无)${RESET}"; echo -e "转发：IPv4 ${GREEN}$(ip_forward_status)${RESET} | IPv6 ${GREEN}$(ip6_forward_status)${RESET} | 公网IPv6 ${GREEN}$(has_public_ipv6 && echo 有 || echo 无)${RESET}"; echo -e "连接跟踪：${GREEN}$(conntrack_status)${RESET} | 内存 ${GREEN}$(mem_status)${RESET}"; echo -e "规则数量：${GREEN}$(managed_count)${RESET} | 启用 ${GREEN}$(enabled_count)${RESET}"; echo -e "域名(DDNS)自动刷新：${GREEN}$(ddns_status)${RESET}"; echo -e "面板类型：${GREEN}SSH 终端菜单，不开放 HTTP 端口${RESET}"; line; }
 main_menu(){
   need_root; ensure_dirs
   while true; do
     header
-    echo "1. 安装/检查依赖"; echo "2. 添加转发规则"; echo "3. 查看转发规则"; echo "4. 修改转发规则"; echo "5. 删除转发规则"; echo "6. 应用规则（iptables/Realm 自动分流）"; echo "7. 查看当前 iptables 规则"; echo "8. 备份与恢复"; echo "9. 卸载面板命令"; echo "10. 更新到最新版"; echo "11. 安装/更新 Realm 双栈引擎"; echo "0. 退出"; short_line
+    echo "1. 安装/检查依赖"; echo "2. 添加转发规则"; echo "3. 查看转发规则"; echo "4. 修改转发规则"; echo "5. 删除转发规则"; echo "6. 应用规则（IPv4/IPv6 双栈自动分流）"; echo "7. 查看当前 iptables 规则"; echo "8. 备份与恢复"; echo "9. 卸载面板命令"; echo "10. 更新到最新版"; echo "0. 退出"; short_line
     local choice
     if ! read_tty choice "请输入选项: "; then
       echo; echo -e "${RED}未检测到可交互键盘输入。请在 SSH 终端里直接运行：sudo zf${RESET}"; exit 1
@@ -734,7 +619,7 @@ main_menu(){
     choice=$(trim "$choice")
     [ -z "$choice" ] && continue
     case "$choice" in
-      1) install_deps;; 2) add_rule;; 3) list_rules;; 4) edit_rule;; 5) delete_rule;; 6) apply_rules;; 7) show_current_iptables;; 8) backup_restore;; 9) uninstall_panel;; 10) update_panel;; 11) install_realm_menu;; 0) exit 0;; *) echo "无效选项：$choice"; sleep 1;;
+      1) install_deps;; 2) add_rule;; 3) list_rules;; 4) edit_rule;; 5) delete_rule;; 6) apply_rules;; 7) show_current_iptables;; 8) backup_restore;; 9) uninstall_panel;; 10) update_panel;; 0) exit 0;; *) echo "无效选项：$choice"; sleep 1;;
     esac
   done
 }

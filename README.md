@@ -36,20 +36,20 @@ sudo zf
 
 ## 当前版本
 
-当前脚本版本：`v0.5.0`
+当前脚本版本：`v0.6.0`
 
-`v0.5.0` 重大更新 —— **双栈转发（iptables + Realm 双引擎）**：
+`v0.6.0` —— **iptables 原生双栈（IPv4 + IPv6，纯内核转发）**：
 
-- **背景**：iptables DNAT 只能在同一地址族内转发（IPv4→IPv4），无法做 IPv6 入口，更无法做 IPv6→IPv4 跨族转发。原生 IPv6 + NAT 后 IPv4（很多便宜 VPS 就是这种）的机器，用纯 iptables 会出现「规则创建成功、`PREROUTING` 计数器永远 0、根本不通」。
-- **新增 Realm 用户态转发引擎**：Realm 监听 `[::]`（同一个监听同时接受 IPv4 与 IPv6 客户端），再主动向目标（IPv4 或 IPv6）建立连接，天然完成 IPv6→IPv4 跨族转发，非常适合 SS2022 等中转→落地场景（中转机不解密、原样转发）。
-- **每条规则可选转发引擎**：
-  - **Auto（推荐）**：目标是 IPv6、或指定 IPv6 监听、或「本机在 NAT/CGNAT IPv4 之后且有公网 IPv6」→ 自动用 Realm；否则 IPv4→IPv4 用 iptables 内核转发（性能最好）。
-  - **Realm 双栈**：强制用 Realm。
-  - **iptables**：强制用纯 IPv4 内核 DNAT。
-- **自动安装 / 托管 Realm**：应用规则时若检测到需要 Realm 会自动下载安装（`v2.9.6`，musl 静态二进制），生成 `/etc/ipt-vibe-panel/realm.toml`，并以 systemd 服务 `ipt-vibe-realm.service` 常驻、开机自启、异常自动重启。菜单也新增 `11. 安装/更新 Realm 双栈引擎`。
-- **Realm 规则的来源白名单**：Realm 无内置 ACL，面板用 `iptables`/`ip6tables` 的 `INPUT` 防火墙锁定监听端口，只放行白名单来源（同时支持 IPv4 与 IPv6 白名单），其余到该端口的新连接直接丢弃——同样能躲避 GFW 主动探测。
-- **DDNS**：Realm 规则的域名解析由 Realm 自身按 DNS TTL 自动重解析；iptables 规则仍走面板的 DDNS 定时刷新。两条路径互不干扰。
-- IPv6 防火墙规则也会持久化到 `/etc/iptables/rules.v6` 并开机恢复。
+- **iptables / ip6tables 双栈**：每条规则按目标地址族自动选引擎 —— IPv4→IPv4 用 `iptables` 的 nat 表，IPv6→IPv6 用 `ip6tables` 的 nat 表，全程内核 DNAT/MASQUERADE 转发，无用户态进程、无额外二进制。
+- **自动识别地址族**：目标或监听是 IPv6 字面量 → 走 ip6tables；IPv4 → 走 iptables；域名按监听族优先，否则先查 A、再查 AAAA。规则列表新增「族」列显示 IPv4/IPv6。
+- **同步开启 IPv6 转发**：`net.ipv6.conf.all.forwarding=1`；IPv6 规则持久化到 `/etc/iptables/rules.v6` 并开机恢复。
+- **来源白名单双栈**：白名单可混填 IPv4 与 IPv6/CIDR，按规则族自动取对应族的条目做 `-s` 限制（防 GFW 主动探测）。
+- **DDNS 双栈**：域名目标按族分别刷新（v4 查 A、v6 查 AAAA），IP 变化时只重建该条规则。
+- **MSS 钳制双栈**：`iptables` 与 `ip6tables` 的 `mangle FORWARD` 都加 TCPMSS 钳制，减少大包黑洞丢包。
+
+> ⚠️ **重要限制：iptables/ip6tables 只能做同族 NAT，做不了 IPv6→IPv4 跨族（NAT64）**。netfilter 的 DNAT 不跨地址族。若你的机器是「公网 IPv6 入口 + 仅 IPv4 落地」这类跨族需求，iptables 双栈覆盖不了，需要 NAT64（Jool/TAYGA）或用户态中继（如 Realm）——本面板 `v0.6.0` 起专注纯 iptables 双栈，不再内置 Realm。落地机若同时有 IPv6，请把目标填 IPv6 走 v6→v6 即可。
+
+> 从 `v0.5.0`（曾内置 Realm）升级上来时，应用规则会自动停用并移除遗留的 `ipt-vibe-realm.service` 与 realm 二进制。
 
 `v0.4.1` 修复致命问题 —— **DDNS 域名目标 IP 变化后转发失效**：
 
@@ -87,7 +87,7 @@ sudo zf
 进入面板后，顶部应显示：
 
 ```text
-iptables Vibe Panel v0.5.0
+iptables Vibe Panel v0.6.0
 ```
 
 如果仍显示旧版本，请重新执行一键安装命令。
@@ -104,12 +104,11 @@ iptables Vibe Panel v0.5.0
 - 备份与恢复。
 - 卸载面板命令。
 - 更新到最新版（面板内一键自更新）。
-- 安装/更新 Realm 双栈引擎（IPv6 入口、IPv6→IPv4 跨族转发）。
 
 ## 规则能力
 
 - 支持 TCP、UDP、TCP+UDP。
-- 支持双栈：每条规则可选 Auto / Realm 双栈 / iptables 引擎；IPv6 入口与 IPv6→IPv4 跨族由 Realm 自动接管。
+- 支持 iptables 原生双栈：IPv4→IPv4 用 iptables、IPv6→IPv6 用 ip6tables，按目标族自动选择（仅同族，不做跨族 NAT64）。
 - 支持单端口和等长端口段转发。
 - 支持目标 IPv4 或域名，应用规则时自动解析域名。
 - 目标为域名时自动跟随 DDNS：后台每 2 分钟重解析，IP 变了自动改写 DNAT，无需手动重应用。
@@ -157,7 +156,7 @@ iptables Vibe Panel v0.5.0
 
 默认执行后端是 `iptables`，这是 Debian 10 的稳妥选择。Debian 10 可能使用 `iptables-legacy`，新系统也可能让 `iptables` 指向 `nf_tables` 后端；面板会显示 `iptables --version` 和后端类型，但仍通过 iptables 命令管理规则。
 
-IPv4→IPv4 用 iptables 内核 DNAT；涉及 IPv6 入口或 IPv6→IPv4 跨族时，`v0.5.0` 起由 Realm 用户态引擎接管（见上文「双栈转发」）。两种引擎按每条规则的「引擎」字段（默认 Auto）自动分流。
+`v0.6.0` 起支持 iptables 原生双栈：IPv4→IPv4 用 `iptables` 的 nat 表，IPv6→IPv6 用 `ip6tables` 的 nat 表，按每条规则的目标地址族自动选择。**仅限同族**；netfilter 不做 IPv6→IPv4 跨族 NAT64（见上文「重要限制」）。
 
 ## 克隆仓库安装
 
@@ -179,13 +178,13 @@ sudo zf
 ## 应用规则时做什么
 
 1. 检查 root 权限、`iptables`、`iptables-save`。
-2. 开启 IPv4 转发：`net.ipv4.ip_forward=1`。
+2. 开启 IPv4/IPv6 转发：`net.ipv4.ip_forward=1`、`net.ipv6.conf.all.forwarding=1`。
 3. 写入 conntrack 调优：缩短过期时间降低内存占用，按内存自动扩容 `nf_conntrack_max` 与哈希桶、开启 `tcp_be_liberal` 减少丢包。
 4. 备份当前 `iptables-save` 输出（仅保留最近 10 份）。
-5. 删除所有带 `ipt-vibe:` 备注的旧规则。
-6. 应用全局优化：`mangle FORWARD` 加 TCP MSS 钳制（`--clamp-mss-to-pmtu`）。
-7. 根据面板状态库重建启用中的规则（带来源白名单时只对白名单来源做 DNAT）。
-8. 持久化并安装开机自动恢复：优先 `netfilter-persistent`；否则自动创建 systemd oneshot 服务 `ipt-vibe-restore.service`；再否则用 `cron @reboot` 兜底。这样重启或死机后规则会自动恢复，无需手动重新应用。
+5. 删除所有带 `ipt-vibe:` 备注的旧规则（iptables 与 ip6tables）。
+6. 应用全局优化：`iptables`/`ip6tables` 的 `mangle FORWARD` 加 TCP MSS 钳制（`--clamp-mss-to-pmtu`）。
+7. 按每条规则的目标地址族重建：IPv4 用 `iptables`、IPv6 用 `ip6tables`（带来源白名单时只对白名单来源做 DNAT）。
+8. 持久化并安装开机自动恢复：优先 `netfilter-persistent`；否则自动创建 systemd oneshot 服务 `ipt-vibe-restore.service`（同时恢复 `rules.v4` 与 `rules.v6`）；再否则用 `cron @reboot` 兜底。
 
 ## 常见问题
 
@@ -323,25 +322,28 @@ grep ddns /etc/ipt-vibe-panel/panel.log
 
 > 说明：刷新只在「解析出的新 IP 与上次不同」时才动规则，且只重建变化的那一条；解析失败时保持原样，不会误删正在工作的转发。刷新间隔受域名 TTL 影响，DDNS 记录 TTL 越低跟随越快。
 
-### 规则创建成功但不通 / `PREROUTING` 计数器一直是 0（原生 IPv6 + NAT IPv4 的机器）
+### IPv6 转发不通 / 想做 IPv6→IPv6 中转
 
-这类机器（公网 IPv6 可直接入站，IPv4 是 `10.x`/`100.64.x` 私网经上游 NAT 才出网）用纯 iptables 一定不通：外部到公网 IPv4 的流量根本没被上游映射到本机私网 IPv4，`PREROUTING` 自然收不到包。
-
-`v0.5.0` 起把这类规则的「引擎」保持 **Auto** 或选 **Realm** 即可：面板会自动用 Realm 监听 `[::]`（IPv6 入口），主动连到落地机的 IPv4，完成 IPv6→IPv4 跨族转发。客户端改用中转机的 **IPv6 地址** 连接即可。
+`v0.6.0` 起支持 IPv6：目标填 IPv6 地址（或只有 AAAA 记录的域名），面板会自动用 `ip6tables` 建规则。核对：
 
 ```bash
-# 确认 Realm 引擎在跑
-systemctl status ipt-vibe-realm.service
-journalctl -u ipt-vibe-realm.service --no-pager | tail -20
+# 确认 ip6tables 存在、IPv6 转发已开
+command -v ip6tables && cat /proc/sys/net/ipv6/conf/all/forwarding
 
-# 确认监听已起来（应看到 [::]:入口端口）
-ss -tlnp | grep realm
+# 查看本工具管理的 v6 规则
+sudo ip6tables -t nat -S PREROUTING | grep ipt-vibe
 
-# 生成的配置
-cat /etc/ipt-vibe-panel/realm.toml
+# 云厂商安全组要放行入口端口的 IPv6；落地机要允许来自中转机 IPv6 的连接
 ```
 
-> SS2022 场景：中转机只做 socket 原样转发，不需要也不会解密 SS2022；密码只在客户端和落地机之间。
+### 公网 IPv6 入口 + 仅 IPv4 落地：iptables 双栈做不了（跨族限制）
+
+如果中转机是「公网 IPv6 可入站，但落地机只有 IPv4」，这是 **IPv6→IPv4 跨族（NAT64）**，`iptables`/`ip6tables` 都做不到 —— netfilter 的 DNAT 不跨地址族，这不是配置问题，是机制限制。
+
+可选方案：
+
+- 落地机若能开 IPv6：目标改填落地机的 IPv6，本面板走 v6→v6 即可。
+- 确需 IPv6→IPv4：用 NAT64（Jool / TAYGA）或用户态中继（如 Realm / gost），本面板 `v0.6.0` 起不内置这类跨族方案。
 
 ### 想让转发端口只对自己开放，躲避 GFW 主动探测
 
@@ -373,6 +375,6 @@ ls -lh /etc/ipt-vibe-panel/backups
 
 本项目只提供 SSH 终端菜单，不提供 HTTP 后台，不监听 `8088` 或其他管理端口。安装脚本会清理旧版可能遗留的 `iptables-vibe-panel.service` systemd 服务文件。
 
-v0.5.0 使用 Realm 引擎时会创建常驻服务 `ipt-vibe-realm.service`（Realm 用户态 relay）。它只监听你配置的转发入口端口，用于做 IPv6/跨族转发，不提供任何管理接口、不解密流量。若某条规则设了来源白名单，还会在 `iptables`/`ip6tables` 的 `INPUT` 上锁定对应端口只放行白名单来源。卸载面板时会一并停用并移除该服务与 Realm 二进制。
+v0.6.0 为纯 iptables/ip6tables 双栈,不再内置任何常驻转发进程;从曾内置 Realm 的 v0.5.0 升级上来时,应用规则会自动停用并移除遗留的 `ipt-vibe-realm.service` 与 realm 二进制。
 
 v0.3.0 为了让规则在重启后自动恢复，可能会创建一个 systemd oneshot 服务 `ipt-vibe-restore.service`。它是 `Type=oneshot`：仅在开机时执行一次 `iptables-restore` 后立即退出，不常驻、不监听端口、不占用运行内存。若系统已装 `netfilter-persistent` 则复用它、不创建该服务。卸载面板时会一并移除。
