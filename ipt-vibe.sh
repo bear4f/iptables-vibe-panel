@@ -2,7 +2,7 @@
 set -uo pipefail
 
 APP_NAME="iptables Vibe Panel"
-VERSION="0.6.0"
+VERSION="0.6.1"
 RAW_BASE="${IPT_VIBE_RAW_BASE:-https://raw.githubusercontent.com/bear4f/iptables-vibe-panel/main}"
 STATE_DIR="/etc/ipt-vibe-panel"
 RULES_FILE="$STATE_DIR/rules.conf"
@@ -571,22 +571,35 @@ backup_restore(){
 }
 uninstall_panel(){ clear; line; echo -e "${CYAN}卸载面板${RESET}"; line; local clean; read_tty clean "是否同时删除本工具管理的 iptables 规则？[y/N]: " || clean=""; if [ "$clean" = "y" ] || [ "$clean" = "Y" ]; then backup_rules >/dev/null; delete_managed_iptables_rules; save_persistent >/dev/null; fi; if command -v systemctl >/dev/null 2>&1 && [ -f /etc/systemd/system/ipt-vibe-restore.service ]; then systemctl disable --now ipt-vibe-restore.service >/dev/null 2>&1 || true; rm -f /etc/systemd/system/ipt-vibe-restore.service; systemctl daemon-reload >/dev/null 2>&1 || true; fi; rm -f /etc/cron.d/ipt-vibe-restore; remove_ddns_timer; cleanup_legacy_realm; rm -f /usr/local/bin/ipt-vibe /usr/local/bin/zf; echo -e "${GREEN}命令已移除。配置目录保留：$STATE_DIR${RESET}"; pause; }
 
-# 自更新：从 GitHub 拉取最新 ipt-vibe.sh 覆盖当前命令。
+# 更新/下载源列表：优先 RAW_BASE（含 IPT_VIBE_RAW_BASE 覆盖），再逐个回退国内可达镜像。
+update_mirrors(){
+  echo "$RAW_BASE"
+  echo "https://cdn.jsdelivr.net/gh/bear4f/iptables-vibe-panel@main"
+  echo "https://ghproxy.net/https://raw.githubusercontent.com/bear4f/iptables-vibe-panel/main"
+  echo "https://raw.gitmirror.com/bear4f/iptables-vibe-panel/main"
+  echo "https://gh-proxy.com/https://raw.githubusercontent.com/bear4f/iptables-vibe-panel/main"
+}
+
+# 自更新：从 GitHub（或镜像）拉取最新 ipt-vibe.sh 覆盖当前命令。
 # 下载后先做校验（非空 + bash 语法 + 含 VERSION 标记），避免半截/被劫持的文件把面板写坏。
 # 用「同目录临时文件 + 原子 mv」替换，保证正在运行的脚本读的是旧 inode，替换过程安全。
 update_panel(){
   clear; line; echo -e "${CYAN}更新到最新版${RESET}"; line
   if ! command -v curl >/dev/null 2>&1; then echo -e "${RED}未找到 curl，请先用菜单 1 安装依赖。${RESET}"; pause; return; fi
-  local target dir tmp new_ver yn
+  local target dir tmp new_ver yn base got=0
   target="/usr/local/bin/ipt-vibe"; [ -e "$target" ] || target=$(command -v ipt-vibe 2>/dev/null || echo "$target")
   dir=$(dirname "$target"); tmp="$dir/.ipt-vibe.update.$$"
   echo -e "当前版本：${GREEN}v$VERSION${RESET}"
-  echo -e "${YELLOW}正在下载：$RAW_BASE/ipt-vibe.sh${RESET}"
-  if ! curl -fsSL "$RAW_BASE/ipt-vibe.sh" -o "$tmp" 2>/dev/null; then
-    echo -e "${RED}下载失败，请检查网络或 GitHub 连通性。原版本未改动。${RESET}"; rm -f "$tmp"; pause; return
-  fi
-  if [ ! -s "$tmp" ] || ! bash -n "$tmp" 2>/dev/null || ! grep -q '^VERSION=' "$tmp"; then
-    echo -e "${RED}下载内容无效或语法异常，已放弃更新。原版本未改动。${RESET}"; rm -f "$tmp"; pause; return
+  # 主源被墙时（GitHub raw 常返回 400/超时）自动回退国内镜像；逐个尝试并校验。
+  for base in $(update_mirrors); do
+    echo -e "${YELLOW}正在下载：$base/ipt-vibe.sh${RESET}"
+    if curl -fsSL "$base/ipt-vibe.sh" -o "$tmp" 2>/dev/null && [ -s "$tmp" ] && bash -n "$tmp" 2>/dev/null && grep -q '^VERSION=' "$tmp"; then
+      got=1; break
+    fi
+    rm -f "$tmp"; echo -e "${YELLOW}  -> 该源失败，尝试下一个镜像...${RESET}"
+  done
+  if [ "$got" != "1" ]; then
+    echo -e "${RED}所有下载源都失败（网络/GitHub 连通性问题）。原版本未改动。${RESET}"; rm -f "$tmp"; pause; return
   fi
   new_ver=$(awk -F'"' '/^VERSION=/{print $2; exit}' "$tmp")
   echo -e "最新版本：${GREEN}v$new_ver${RESET}"

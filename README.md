@@ -12,6 +12,24 @@
 curl -fsSL https://raw.githubusercontent.com/bear4f/iptables-vibe-panel/main/install.sh | sudo bash
 ```
 
+> 安装脚本会在下载 `ipt-vibe.sh` 时自动尝试多个镜像（GitHub raw → jsdelivr → ghproxy → gitmirror），主源被墙时会自动回退，无需手动干预。
+
+### GitHub 被墙 / 报 `curl: (22) ... error: 400`（国内网络常见）
+
+如果连 `install.sh` 本身都拉不下来（`raw.githubusercontent.com` 被干扰），改用镜像拉安装脚本，并让它也从镜像拉主程序：
+
+```bash
+# 方式一：jsdelivr 镜像
+curl -fsSL https://cdn.jsdelivr.net/gh/bear4f/iptables-vibe-panel@main/install.sh \
+  | IPT_VIBE_RAW_BASE="https://cdn.jsdelivr.net/gh/bear4f/iptables-vibe-panel@main" sudo -E bash
+
+# 方式二：ghproxy 反代（拉实时最新）
+curl -fsSL https://ghproxy.net/https://raw.githubusercontent.com/bear4f/iptables-vibe-panel/main/install.sh \
+  | IPT_VIBE_RAW_BASE="https://ghproxy.net/https://raw.githubusercontent.com/bear4f/iptables-vibe-panel/main" sudo -E bash
+```
+
+> 请用 `bash` 运行，不要用 `ash`。`sudo -E` 用于把 `IPT_VIBE_RAW_BASE` 传进 root 环境。
+
 安装或更新完成后，单独执行下面的命令打开面板：
 
 ```bash
@@ -36,7 +54,9 @@ sudo zf
 
 ## 当前版本
 
-当前脚本版本：`v0.6.0`
+当前脚本版本：`v0.6.1`
+
+`v0.6.1` —— **下载源镜像自动回退**：`raw.githubusercontent.com` 在国内常被干扰（`curl (22) error 400`/超时）。安装脚本与面板内「更新到最新版」现在会依次尝试 GitHub raw → jsdelivr → ghproxy → gitmirror，任一可达即成功；下载后校验非空 + 语法 + 版本标记，避免把错误页当成脚本。install.sh 改为 POSIX sh 兼容（`sh`/`bash` 均可）。
 
 `v0.6.0` —— **iptables 原生双栈（IPv4 + IPv6，纯内核转发）**：
 
@@ -87,7 +107,7 @@ sudo zf
 进入面板后，顶部应显示：
 
 ```text
-iptables Vibe Panel v0.6.0
+iptables Vibe Panel v0.6.1
 ```
 
 如果仍显示旧版本，请重新执行一键安装命令。
